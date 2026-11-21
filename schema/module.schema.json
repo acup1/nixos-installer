@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Метаданные модуля Nix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "title", "description", "layers"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "title": {"type": "string", "minLength": 1},
+    "description": {"type": "string", "minLength": 1},
+    "layers": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "nixos": {"const": ["linux"]},
+        "darwin": {"const": ["darwin"]},
+        "home": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["linux", "darwin"]}
+        }
+      }
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["layer", "path", "type", "title", "description"],
+        "properties": {
+          "layer": {"enum": ["nixos", "darwin", "home"]},
+          "path": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "pattern": "^[-_A-Za-z0-9][-_A-Za-z0-9.]*$"}
+          },
+          "type": {"enum": ["bool", "integer", "string", "string_list", "packages"]},
+          "title": {"type": "string", "minLength": 1},
+          "description": {"type": "string", "minLength": 1},
+          "default": {}
+        },
+        "allOf": [
+          {"if": {"properties": {"type": {"const": "bool"}}}, "then": {"properties": {"default": {"type": "boolean"}}}},
+          {"if": {"properties": {"type": {"const": "integer"}}}, "then": {"properties": {"default": {"type": "integer"}}}},
+          {"if": {"properties": {"type": {"const": "string"}}}, "then": {"properties": {"default": {"type": "string"}}}},
+          {"if": {"properties": {"type": {"const": "string_list"}}}, "then": {"properties": {"default": {"type": "array", "items": {"type": "string"}}}}},
+          {"if": {"properties": {"type": {"const": "packages"}}}, "then": {"properties": {"default": {"type": "array", "items": {"type": "string", "pattern": "^[-_+A-Za-z0-9]+(\\.[-_+A-Za-z0-9]+)*$"}}}}}
+        ]
+      }
+    }
+  }
+}
