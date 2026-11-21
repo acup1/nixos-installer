@@ -29,9 +29,9 @@ jobs:
         if: matrix.system == 'x86_64-linux'
         run: |
           sudo apt-get install -y nix-bin
-          sudo nix-store --init
-          sudo systemctl start nix-daemon.socket
-          nix --extra-experimental-features 'nix-command flakes' eval --raw --expr '"Nix evaluator ready"'
+          # These fixtures evaluate local expressions without building or fetching.
+          echo 'NIX_REMOTE=dummy://' >> "$GITHUB_ENV"
+          NIX_REMOTE=dummy:// nix --extra-experimental-features 'nix-command flakes' eval --raw --expr '"Nix evaluator ready"'
       - name: Test installer
         shell: bash
         run: |
