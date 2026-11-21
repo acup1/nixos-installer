@@ -27,8 +27,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Enable selector integration tests with Nix
         if: matrix.system == 'x86_64-linux'
-        run: sudo apt-get install -y nix-bin
-      - run: cargo test --locked --target "${{ matrix.target }}"
+        run: |
+          sudo apt-get install -y nix-bin
+          sudo nix-store --init
+          sudo systemctl start nix-daemon.socket
+          nix --extra-experimental-features 'nix-command flakes' eval --raw --expr '"Nix evaluator ready"'
+      - name: Test installer
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/installer-tests.log"
+          if ! cargo test --locked --target "${{ matrix.target }}" >"$log" 2>&1; then
+            cat "$log"
+            sed -n '/^failures:/,/^test result:/p' "$log" | while IFS= read -r line; do
+              if [[ -n "$line" ]]; then printf '::error::%s\n' "${line//'%'/'%25'}"; fi
+            done
+            exit 1
+          fi
+          cat "$log"
       - run: cargo build --locked --release --target "${{ matrix.target }}"
       - name: Check and stage executable
         shell: bash
