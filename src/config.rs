@@ -444,11 +444,7 @@ impl Selector {
         let inputs = if host.is_empty() {
             "{}".into()
         } else {
-            let host = Path::new(host)
-                .canonicalize()
-                .ok()
-                .and_then(|path| path.to_str().map(str::to_string))
-                .unwrap_or_else(|| host.into());
+            let host = nix_flake_reference(host);
             format!(
                 r#"(let flake = builtins.getFlake {}; in flake.inputs // {{ self = flake; }})"#,
                 quote(&host)
@@ -673,6 +669,36 @@ pub fn flake_reference(installable: &str) -> &str {
         .map_or(installable, |(reference, _)| reference)
 }
 
+fn nix_flake_reference(reference: &str) -> String {
+    use std::fmt::Write as _;
+
+    let Ok(path) = Path::new(reference).canonicalize() else {
+        return reference.into();
+    };
+    let Some(absolute) = path.to_str() else {
+        return reference.into();
+    };
+    let url_safe = |byte: u8| byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte);
+    if absolute.bytes().all(url_safe) {
+        return absolute.into();
+    }
+
+    // Older Nix accepts a percent-encoded local URI for paths with spaces.
+    let mut uri = String::from(if path.join(".git").exists() {
+        "git+file://"
+    } else {
+        "path:"
+    });
+    for byte in absolute.bytes() {
+        if url_safe(byte) {
+            uri.push(char::from(byte));
+        } else {
+            write!(&mut uri, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    uri
+}
+
 pub struct RebuildTarget {
     platform: HostPlatform,
     flake: String,
@@ -696,13 +722,14 @@ impl RebuildTarget {
         if reference.trim().is_empty() || reference.starts_with('-') {
             return Err("Set flakeDir in the selector or enter a host flake override.".into());
         }
+        let reference = nix_flake_reference(reference);
         let path = selector.to_str().ok_or("Selector path must be UTF-8")?;
         let outputs = platform.outputs();
         let data: FlakeOutputs = nix_json(
             selector,
             &format!(
                 "let flake = builtins.getFlake {}; cfg = import (builtins.toPath {}) {{ inputs = flake.inputs // {{ self = flake; }}; }}; in {{ names = builtins.attrNames (flake.{outputs} or {{}}); username = cfg.username or null; hostname = cfg.hostName or null; }}",
-                quote(reference),
+                quote(&reference),
                 quote(path),
             ),
         )?;
@@ -733,7 +760,7 @@ impl RebuildTarget {
         };
         Ok(Self {
             platform,
-            flake: reference.into(),
+            flake: reference,
             name: name.clone(),
         })
     }
@@ -876,6 +903,7 @@ mod selector_tests {
             host.canonicalize().unwrap()
         );
         let darwin = RebuildTarget::resolve_for(&flake, &selector, HostPlatform::Darwin).unwrap();
+        assert!(darwin.flake.starts_with("path:") && darwin.flake.ends_with("/host%20flake"));
         let command = darwin.command(&selector);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -884,7 +912,7 @@ mod selector_tests {
                 "switch",
                 "--hostname",
                 "local-OSX",
-                &flake,
+                &darwin.flake,
                 "--",
                 "--impure"
             ]
