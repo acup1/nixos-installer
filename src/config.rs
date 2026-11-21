@@ -421,6 +421,17 @@ impl Selector {
             .map_or_else(BTreeSet::new, |record| record.masked.clone())
     }
 
+    pub fn flake_dir(&self) -> Result<Option<String>> {
+        let path = self.path.to_str().ok_or("Selector path must be UTF-8")?;
+        nix_json(
+            &self.path,
+            &format!(
+                "let cfg = import (builtins.toPath {}) {{ inputs = {{}}; }}; in if (cfg.flakeDir or null) == null then null else toString cfg.flakeDir",
+                quote(path),
+            ),
+        )
+    }
+
     pub fn original_paths(&self, host: &str) -> Result<Vec<String>> {
         let original = if self.backup.is_some() {
             backup_path(&self.path)
@@ -429,7 +440,7 @@ impl Selector {
         } else {
             self.path.clone()
         };
-        let host = host.split_once('#').map_or(host, |(path, _)| path);
+        let host = flake_reference(host);
         let inputs = if host.is_empty() {
             "{}".into()
         } else {
@@ -627,24 +638,132 @@ pub fn architecture() -> Result<String> {
     Ok(format!("{arch}-{os}"))
 }
 
-pub fn rebuild(flake: &str, selector: &str) -> Result<()> {
-    if flake.trim().is_empty() || flake.starts_with('-') {
-        return Err("Set the host flake path first".into());
+#[derive(Clone, Copy)]
+enum HostPlatform {
+    Linux,
+    Darwin,
+}
+
+impl HostPlatform {
+    fn outputs(self) -> &'static str {
+        match self {
+            Self::Linux => "nixosConfigurations",
+            Self::Darwin => "darwinConfigurations",
+        }
     }
-    let system = if cfg!(target_os = "macos") {
-        "darwin"
-    } else {
-        "os"
-    };
-    let status = Command::new("nh")
-        .args([system, "switch", flake, "--", "--impure"])
-        .env("NIXOS_BASE_CONFIG", selector)
-        .status()
-        .map_err(|e| format!("nh: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("nh exited with {status}"))
+
+    fn nh_command(self) -> &'static str {
+        match self {
+            Self::Linux => "os",
+            Self::Darwin => "darwin",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FlakeOutputs {
+    names: Vec<String>,
+    username: Option<String>,
+    hostname: Option<String>,
+}
+
+pub fn flake_reference(installable: &str) -> &str {
+    installable
+        .split_once('#')
+        .map_or(installable, |(reference, _)| reference)
+}
+
+pub struct RebuildTarget {
+    platform: HostPlatform,
+    flake: String,
+    name: String,
+}
+
+impl RebuildTarget {
+    pub fn resolve(flake: &str, selector: &Path) -> Result<Self> {
+        let platform = if cfg!(target_os = "macos") {
+            HostPlatform::Darwin
+        } else {
+            HostPlatform::Linux
+        };
+        Self::resolve_for(flake, selector, platform)
+    }
+
+    fn resolve_for(flake: &str, selector: &Path, platform: HostPlatform) -> Result<Self> {
+        let (reference, explicit) = flake
+            .split_once('#')
+            .map_or((flake, None), |(reference, name)| (reference, Some(name)));
+        if reference.trim().is_empty() || reference.starts_with('-') {
+            return Err("Set flakeDir in the selector or enter a host flake override.".into());
+        }
+        let path = selector.to_str().ok_or("Selector path must be UTF-8")?;
+        let outputs = platform.outputs();
+        let data: FlakeOutputs = nix_json(
+            selector,
+            &format!(
+                "let flake = builtins.getFlake {}; cfg = import (builtins.toPath {}) {{ inputs = flake.inputs // {{ self = flake; }}; }}; in {{ names = builtins.attrNames (flake.{outputs} or {{}}); username = cfg.username or null; hostname = cfg.hostName or null; }}",
+                quote(reference),
+                quote(path),
+            ),
+        )?;
+        let name = if let Some(explicit) = explicit {
+            data.names
+                .iter()
+                .find(|name| name.as_str() == explicit)
+                .ok_or_else(|| format!("{reference} does not export {outputs}.{explicit}."))?
+        } else {
+            let preferred = match platform {
+                HostPlatform::Darwin => data.username.map(|name| format!("{name}-OSX")),
+                HostPlatform::Linux => data.hostname.clone(),
+            };
+            let fallback = match platform {
+                HostPlatform::Darwin => data.hostname.as_deref(),
+                HostPlatform::Linux => Some("nixos"),
+            };
+            [preferred.as_deref(), fallback].into_iter().flatten()
+                .find_map(|candidate| data.names.iter().find(|name| name.as_str() == candidate))
+                .or(match data.names.as_slice() { [name] => Some(name), _ => None })
+                .ok_or_else(|| {
+                    if data.names.is_empty() {
+                        format!("{reference} exports no {outputs}.")
+                    } else {
+                        format!("Choose a host override as {reference}#HOST. Available configurations: {}.", data.names.join(", "))
+                    }
+                })?
+        };
+        Ok(Self {
+            platform,
+            flake: reference.into(),
+            name: name.clone(),
+        })
+    }
+
+    fn command(&self, selector: &Path) -> Command {
+        let mut command = Command::new("nh");
+        command
+            .args([
+                self.platform.nh_command(),
+                "switch",
+                "--hostname",
+                &self.name,
+                &self.flake,
+                "--",
+                "--impure",
+            ])
+            .env("NIXOS_BASE_CONFIG", selector);
+        command
+    }
+
+    pub fn rebuild(&self, selector: &Path) -> Result<()> {
+        let status = self
+            .command(selector)
+            .status()
+            .map_err(|e| format!("nh: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("nh exited with {status}"))
+        }
     }
 }
 
@@ -717,6 +836,83 @@ mod selector_tests {
             .arg("--version")
             .output()
             .is_ok_and(|output| output.status.success())
+    }
+
+    #[test]
+    fn discovers_flake_and_targets_only_exported_systems() {
+        if !nix_available() {
+            return;
+        }
+        let fixture = Fixture::new();
+        let host = fixture.0.join("host flake");
+        fs::create_dir(&host).unwrap();
+        fs::write(
+            host.join("flake.nix"),
+            r#"{
+              outputs = { self }: {
+                darwinConfigurations.local-OSX = throw "must not build system";
+                darwinConfigurations.other = {};
+                nixosConfigurations.nixos = throw "must not build system";
+                nixosConfigurations.machine = {};
+              };
+            }"#,
+        )
+        .unwrap();
+        let selector = fixture.0.join("custom.nix");
+        fs::write(
+            &selector,
+            r#"{ inputs }: let root = ./. + "/host flake"; in {
+            flakeDir = root;
+            username = "local";
+            hostName = "unrelated-hostname";
+            modules = throw "must not force modules";
+        }"#,
+        )
+        .unwrap();
+        let source = Selector::read(&selector).unwrap().unwrap();
+        let flake = source.flake_dir().unwrap().unwrap();
+        assert_eq!(
+            Path::new(&flake).canonicalize().unwrap(),
+            host.canonicalize().unwrap()
+        );
+        let darwin = RebuildTarget::resolve_for(&flake, &selector, HostPlatform::Darwin).unwrap();
+        let command = darwin.command(&selector);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "darwin",
+                "switch",
+                "--hostname",
+                "local-OSX",
+                &flake,
+                "--",
+                "--impure"
+            ]
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, path)| name == "NIXOS_BASE_CONFIG"
+                    && path == Some(selector.as_os_str()))
+        );
+        let linux = RebuildTarget::resolve_for(&flake, &selector, HostPlatform::Linux).unwrap();
+        assert_eq!(linux.name, "nixos");
+        let explicit =
+            RebuildTarget::resolve_for(&format!("{flake}#other"), &selector, HostPlatform::Darwin)
+                .unwrap();
+        assert_eq!(explicit.name, "other");
+        assert!(
+            RebuildTarget::resolve_for(
+                &format!("{flake}#missing"),
+                &selector,
+                HostPlatform::Darwin
+            )
+            .is_err()
+        );
+
+        fs::write(&selector, "{...}: { hostName = \"machine\"; }").unwrap();
+        let fresh = RebuildTarget::resolve_for(&flake, &selector, HostPlatform::Linux).unwrap();
+        assert_eq!(fresh.name, "machine");
     }
 
     #[test]

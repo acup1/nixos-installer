@@ -31,6 +31,7 @@ pub struct Session {
     pub repositories: Vec<SourceSpec>,
     pub modules: Vec<ModuleRow>,
     pub flake: String,
+    pub detected_flake: String,
     pub selector: String,
     pub install: InstallRequest,
     pub disks: Vec<BlockDevice>,
@@ -51,11 +52,20 @@ impl Session {
             repositories,
             modules: Vec::new(),
             flake,
+            detected_flake: String::new(),
             selector,
             install,
             disks: Vec::new(),
             plan: None,
             message: None,
+        }
+    }
+
+    pub fn host_flake(&self) -> &str {
+        if self.flake.is_empty() {
+            &self.detected_flake
+        } else {
+            &self.flake
         }
     }
 }
@@ -523,7 +533,17 @@ impl Ui {
                     ));
                 }
                 if state.mode == Mode::Configure {
-                    rows.push(Row::field("Host flake", &state.flake, Field::Flake));
+                    let detected = if state.detected_flake.is_empty() {
+                        "Automatic from selector".to_string()
+                    } else {
+                        format!("{} (automatic)", state.detected_flake)
+                    };
+                    let flake = if state.flake.is_empty() {
+                        &detected
+                    } else {
+                        &state.flake
+                    };
+                    rows.push(Row::field("Host flake", flake, Field::Flake));
                     rows.push(Row::field(
                         "Selector file",
                         &state.selector,
@@ -793,13 +813,10 @@ impl Ui {
                 );
                 rows.insert(
                     1,
-                    if selector_valid && !state.flake.trim().is_empty() {
-                        Row::action(
-                            "Save and run nh rebuild…",
-                            Control::Confirm(Action::Rebuild),
-                        )
+                    if selector_valid && !state.host_flake().trim().is_empty() {
+                        Row::action("Rebuild", Control::Send(Action::Rebuild))
                     } else {
-                        Row::note("Rebuild unavailable · set host flake and selector paths")
+                        Row::note("Rebuild unavailable · load a selector with flakeDir")
                     },
                 );
             }
@@ -1042,7 +1059,6 @@ impl Ui {
                     },
                     Action::EditPartitions(disk) => format!("PARTITION {disk}"),
                     Action::Calamares => "CALAMARES".into(),
-                    Action::Rebuild => "REBUILD".into(),
                     _ => return Outcome::Continue,
                 };
                 self.modal = Some(Modal::Edit(Editor {
@@ -1303,7 +1319,11 @@ impl Ui {
                 if !PathBuf::from(value).is_absolute() {
                     return Err("Enter an absolute selector path.".into());
                 }
-                state.selector = value.into();
+                if state.selector != value {
+                    state.selector = value.into();
+                    state.flake.clear();
+                    state.detected_flake.clear();
+                }
             }
             Field::Hostname => state.install.hostname = value.into(),
             Field::Username => state.install.username = value.into(),
@@ -1868,7 +1888,7 @@ fn field_title(field: Field) -> &'static str {
         Field::Reference(_) => "Git reference",
         Field::Search => "Filter modules",
         Field::Parameter(..) => "Module parameter",
-        Field::Flake => "Host flake reference",
+        Field::Flake => "Host flake override (empty uses selector)",
         Field::Selector => "Absolute selector path",
         Field::Hostname => "Hostname",
         Field::Username => "Username",
@@ -2136,6 +2156,37 @@ mod tests {
             .filter_map(|x| frame.get(row, x))
             .map(|cell| cell.symbol.as_str())
             .collect()
+    }
+
+    #[test]
+    fn rebuild_runs_on_first_keyboard_or_mouse_activation() {
+        let mut state = session();
+        state.detected_flake = std::mem::take(&mut state.flake);
+        let mut ui = Ui {
+            page: 2,
+            focus: 1,
+            ..Ui::default()
+        };
+        assert!(matches!(
+            ui.event(&mut state, Event::Key(13)),
+            Outcome::Execute(Action::Rebuild)
+        ));
+        assert!(ui.modal.is_none());
+
+        let mut frame = FrameBuffer::new(98, 26);
+        ui.render(&mut frame, &state);
+        let area = ui.hits.iter().find(|(_, index)| *index == 1).unwrap().0;
+        let click = Event::Mouse(Mouse {
+            x: area.x as u16,
+            y: area.y as u16,
+            event: MouseEvent::LEFT,
+            ..Mouse::default()
+        });
+        assert!(matches!(
+            ui.event(&mut state, click),
+            Outcome::Execute(Action::Rebuild)
+        ));
+        assert!(ui.modal.is_none());
     }
 
     #[test]

@@ -26,6 +26,7 @@ struct Saved {
     repositories: Vec<SourceSpec>,
     selections: Vec<Selected>,
     flake: String,
+    flake_override: String,
     selector: String,
 }
 
@@ -72,7 +73,29 @@ impl Controller {
     }
     fn refresh(&mut self, state: &mut Session, update: bool) -> Result<String> {
         let selector_path = Path::new(&state.selector);
-        let same_selector = self.inspected_host == state.flake
+        let selector = if state.mode == Mode::Configure {
+            Selector::read(selector_path)?
+        } else {
+            None
+        };
+        state.detected_flake = if state.flake.is_empty() {
+            selector
+                .as_ref()
+                .map(Selector::flake_dir)
+                .transpose()?
+                .flatten()
+                .filter(|reference| !reference.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if self.saved.selector == state.selector {
+                        self.saved.flake.clone()
+                    } else {
+                        String::new()
+                    }
+                })
+        } else {
+            String::new()
+        };
+        let same_selector = self.inspected_host == config::flake_reference(state.host_flake())
             && self
                 .selector
                 .as_ref()
@@ -94,11 +117,6 @@ impl Controller {
         } else {
             HashMap::new()
         };
-        let selector = if state.mode == Mode::Configure {
-            Selector::read(selector_path)?
-        } else {
-            None
-        };
         let repositories = if !same_selector {
             selector
                 .as_ref()
@@ -110,7 +128,7 @@ impl Controller {
         };
         let originals = selector
             .as_ref()
-            .map(|selector| selector.original_paths(&state.flake))
+            .map(|selector| selector.original_paths(state.host_flake()))
             .transpose()?
             .unwrap_or_default();
         let persisted = selector
@@ -183,7 +201,7 @@ impl Controller {
         state.repositories = repositories;
         self.sources = sources;
         self.selector = selector;
-        self.inspected_host = state.flake.clone();
+        self.inspected_host = config::flake_reference(state.host_flake()).to_owned();
         self.manual = manual;
         state.modules = rows;
         state.plan = None;
@@ -252,7 +270,8 @@ impl Controller {
             repositories: s.repositories.clone(),
             selections: self.selections(s),
             selector: s.selector.clone(),
-            flake: s.flake.clone(),
+            flake: s.host_flake().to_owned(),
+            flake_override: s.flake.clone(),
         }
     }
     fn synchronized_state(&self, state: &Session, target: bool) -> Saved {
@@ -301,7 +320,9 @@ impl Controller {
             .selector
             .as_ref()
             .ok_or("Load an existing selector before saving.")?;
-        if self.inspected_host != state.flake || !selector.current(path) {
+        if self.inspected_host != config::flake_reference(state.host_flake())
+            || !selector.current(path)
+        {
             return Err("The host or selector changed. Refresh the catalog before saving.".into());
         }
         let choices = self.choices(state)?;
@@ -384,6 +405,7 @@ impl Controller {
             }
             let mut saved = self.synchronized_state(state, true);
             saved.flake = format!("/etc/nixos#{}", req.hostname);
+            saved.flake_override.clear();
             saved.selector = "/etc/nixos/config.nix".into();
             config::create_selector(
                 &dir.join("config.nix"),
@@ -475,8 +497,10 @@ impl Controller {
             Action::ApplyInstall => self.apply(state),
             Action::Save => self.save(state),
             Action::Rebuild => {
+                let target =
+                    config::RebuildTarget::resolve(state.host_flake(), Path::new(&state.selector))?;
                 self.save(state)?;
-                config::rebuild(&state.flake, &state.selector)?;
+                target.rebuild(Path::new(&state.selector))?;
                 Ok("System rebuilt".into())
             }
         }
@@ -644,7 +668,7 @@ fn copy_commit(source: &CatalogSource, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-const HELP: &str = "nixos-installer [configure|install]\n\nconfigure  Select module repositories, edit parameters and rebuild with nh.\ninstall    Install NixOS on a Linux machine (root required to apply).\n\nUse the repository and path controls to select your host flake and config.nix.\n  --version    Print the release version\n  --help       Show this help";
+const HELP: &str = "nixos-installer [configure|install]\n\nconfigure  Select module repositories, edit parameters and rebuild with nh.\ninstall    Install NixOS on a Linux machine (root required to apply).\n\nThe selector config.nix supplies flakeDir. Set a host flake override to use another reference or target.\n  --version    Print the release version\n  --help       Show this help";
 fn default_request() -> InstallRequest {
     InstallRequest {
         layout: DiskLayout::Mounted {
@@ -721,8 +745,11 @@ fn run() -> Result<()> {
     let flake = env::var("NH_FLAKE")
         .ok()
         .filter(|path| !path.is_empty())
-        .or_else(|| (!saved.flake.is_empty()).then(|| saved.flake.clone()))
-        .unwrap_or_else(|| "/etc/nixos".into());
+        .or_else(|| {
+            (saved.selector == selector && !saved.flake_override.is_empty())
+                .then(|| saved.flake_override.clone())
+        })
+        .unwrap_or_default();
     let managed = if mode == Mode::Configure {
         Selector::read(Path::new(&selector)).ok().flatten()
     } else {
@@ -804,6 +831,41 @@ mod controller_tests {
             inspected_host: String::new(),
             manual: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn selector_flake_dir_takes_priority_over_stale_saved_host() {
+        if !Command::new("nix")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.nix");
+        fs::write(fixture.0.join("flake.nix"), "{ outputs = { self }: {}; }").unwrap();
+        fs::write(
+            &path,
+            "{ inputs }: { flakeDir = toString ./.; modules = []; }",
+        )
+        .unwrap();
+        let mut state = Session::new(
+            Mode::Configure,
+            vec![],
+            default_request(),
+            String::new(),
+            path.display().to_string(),
+        );
+        let mut editor = controller(&fixture.0.join("state"));
+        editor.saved.selector = state.selector.clone();
+        editor.saved.flake = "/obsolete-host".into();
+
+        editor.refresh(&mut state, false).unwrap();
+        assert_eq!(state.host_flake(), fixture.0.to_str().unwrap());
+        state.flake = format!("{}#another", state.host_flake());
+        editor.save(&mut state).unwrap();
+        assert_eq!(editor.saved.flake_override, state.flake);
     }
 
     #[test]
