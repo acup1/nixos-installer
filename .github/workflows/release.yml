@@ -29,9 +29,10 @@ jobs:
         if: matrix.system == 'x86_64-linux'
         run: |
           sudo apt-get install -y nix-bin
-          # These fixtures evaluate local expressions without building or fetching.
-          echo 'NIX_REMOTE=dummy://' >> "$GITHUB_ENV"
-          NIX_REMOTE=dummy:// nix --extra-experimental-features 'nix-command flakes' eval --raw --expr '"Nix evaluator ready"'
+          # The local flake fixture needs a store for its source snapshot.
+          selector_store="local?root=$RUNNER_TEMP/nix-selector-store"
+          echo "NIX_REMOTE=$selector_store" >> "$GITHUB_ENV"
+          NIX_REMOTE="$selector_store" nix --extra-experimental-features 'nix-command flakes' eval --raw --expr '"Nix evaluator ready"'
       - name: Test installer
         shell: bash
         run: |
