@@ -335,7 +335,7 @@ where
     // system or global configuration and must avoid running smudge filters.
     if !arguments
         .peek()
-        .is_some_and(|argument| argument.as_ref() == "fetch")
+        .is_some_and(|argument| matches!(argument.as_ref().to_str(), Some("fetch" | "ls-remote")))
     {
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -484,13 +484,13 @@ fn remote_url(repository: &str) -> Result<String, String> {
         {
             return Ok(repository.into());
         }
-    } else if let Some((host, path)) = repository.split_once(':') {
-        if host.split_once('@').is_some_and(|(user, host)| {
+    } else if let Some((host, path)) = repository.split_once(':')
+        && host.split_once('@').is_some_and(|(user, host)| {
             valid_segment(user) && !user.starts_with('-') && valid_host(host)
-        }) && !path.trim_matches('/').is_empty()
-        {
-            return Ok(format!("ssh://{host}/{}", path.trim_start_matches('/')));
-        }
+        })
+        && !path.trim_matches('/').is_empty()
+    {
+        return Ok(format!("ssh://{host}/{}", path.trim_start_matches('/')));
     }
     Err("Укажите локальный Git-репозиторий или URL HTTPS/SSH".into())
 }
@@ -635,6 +635,40 @@ fn cached_checkout(
         }
     }
     Ok((checkout, record.revision))
+}
+
+/// Resolve moving remote references on an explicit refresh. Existing cached
+/// checkouts stay at their original commits for running configurations.
+pub fn discover_updated(spec: &SourceSpec, cache: &Path) -> Result<CatalogSource, String> {
+    if Path::new(&spec.repository).exists() || is_commit_id(&spec.reference) {
+        return discover(spec, cache);
+    }
+    let current = std::env::current_dir().map_err(|e| e.to_string())?;
+    let selector = reference_selector(&spec.reference, &current)?;
+    let url = remote_url(&spec.repository)?;
+    let peeled = format!("{selector}^{{}}");
+    let output = run_git(
+        &current,
+        ["ls-remote", "--exit-code", "--", &url, &selector, &peeled],
+        false,
+    )?;
+    let refs: BTreeMap<_, _> = output
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(rev, name)| (name, rev)))
+        .collect();
+    let rev = refs
+        .get(peeled.as_str())
+        .or_else(|| refs.get(selector.as_str()))
+        .filter(|rev| is_commit_id(rev))
+        .ok_or_else(|| format!("Git reference {selector} was not found"))?;
+    let pinned = SourceSpec {
+        repository: url,
+        reference: (*rev).to_string(),
+        mode: spec.mode,
+    };
+    let mut source = discover(&pinned, cache)?;
+    source.spec.reference.clone_from(&spec.reference);
+    Ok(source)
 }
 
 pub fn discover(spec: &SourceSpec, cache: &Path) -> Result<CatalogSource, String> {

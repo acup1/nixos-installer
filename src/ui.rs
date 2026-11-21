@@ -160,6 +160,7 @@ enum DeviceSlot {
     Disk,
     Root,
     Esp,
+    AlongsideEsp,
     BootDisk,
     PartitionEditor,
 }
@@ -174,6 +175,7 @@ enum Control {
     Change(Setting),
     Choose(DeviceSlot),
     Page(usize),
+    ShowPlan,
     Send(Action),
     Confirm(Action),
 }
@@ -237,7 +239,11 @@ struct Picker {
 enum Modal {
     Edit(Editor),
     Pick(Picker),
-    Notice { text: String, offset: usize },
+    Notice {
+        title: &'static str,
+        text: String,
+        offset: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -301,6 +307,7 @@ pub fn run(
         .as_ref()
         .filter(|(_, success)| !*success)
         .map(|(text, _)| Modal::Notice {
+            title: "Catalog unavailable",
             text: text.clone(),
             offset: 0,
         });
@@ -335,6 +342,9 @@ pub fn run(
                 if matches!(action, Action::EditPartitions(_) | Action::Calamares) {
                     state.plan = None;
                 }
+                if matches!(action, Action::Calamares) {
+                    state.disks.clear();
+                }
                 let applied = matches!(action, Action::ApplyInstall);
                 let review = matches!(action, Action::ReviewInstall);
                 let refresh = matches!(action, Action::RefreshCatalog);
@@ -349,6 +359,7 @@ pub fn run(
                             state.plan = None;
                         }
                         ui.modal = Some(Modal::Notice {
+                            title: "Action failed",
                             text: message.clone(),
                             offset: 0,
                         });
@@ -414,6 +425,14 @@ fn selected_count(state: &Session) -> usize {
         .iter()
         .filter(|module| module.selected)
         .count()
+}
+
+fn module_label(row: &ModuleRow, repositories: usize) -> String {
+    if repositories > 1 {
+        format!("[repo {}] {}", row.repository + 1, row.module.path)
+    } else {
+        row.module.path.clone()
+    }
 }
 
 fn boot_name(boot: &BootMode) -> &'static str {
@@ -534,7 +553,11 @@ impl Ui {
                     }
                     found = true;
                     let checked = if row.selected { "[×]" } else { "[ ]" };
-                    let title = format!("{checked} {} · {}", module.path, module.manifest.title);
+                    let title = format!(
+                        "{checked} {} · {}",
+                        module_label(row, state.repositories.len()),
+                        module.manifest.title
+                    );
                     if !module.manifest.supports(platform) {
                         rows.push(Row::note(format!("{title} · unavailable on this platform")));
                         continue;
@@ -607,18 +630,42 @@ impl Ui {
         let request = &state.install;
         let layout = match &request.layout {
             DiskLayout::Erase { .. } => "Erase a disk",
+            DiskLayout::Alongside { .. } => "Install in unallocated space",
             DiskLayout::Partitions { .. } => "Use existing partitions",
             DiskLayout::Mounted { .. } => "Use a mounted target",
         };
-        let mut rows = vec![Row::action(
-            format!("Layout             {layout}"),
-            Control::Change(Setting::Layout),
-        )];
+        let mut rows = vec![
+            Row::action(
+                format!("Layout             {layout}"),
+                Control::Change(Setting::Layout),
+            ),
+            Row::action("Refresh disk list", Control::Send(Action::RefreshDisks)),
+        ];
         match &request.layout {
             DiskLayout::Erase { disk } => rows.push(Row::action(
                 format!("Target disk        {}", partition_name(disk)),
                 Control::Choose(DeviceSlot::Disk),
             )),
+            DiskLayout::Alongside { disk, esp } => {
+                rows.push(Row::note(
+                    "Use an existing GPT disk with unallocated space.",
+                ));
+                rows.push(Row::action(
+                    format!("Target disk        {}", partition_name(disk)),
+                    Control::Choose(DeviceSlot::Disk),
+                ));
+                rows.push(if disk.is_empty() {
+                    Row::note("EFI partition      Choose a target disk first")
+                } else {
+                    Row::action(
+                        format!(
+                            "EFI partition      {}",
+                            esp.as_deref().unwrap_or("Create dedicated EFI")
+                        ),
+                        Control::Choose(DeviceSlot::AlongsideEsp),
+                    )
+                });
+            }
             DiskLayout::Partitions {
                 root,
                 esp,
@@ -662,10 +709,14 @@ impl Ui {
                 Field::Target,
             )),
         }
-        rows.push(Row::action(
-            format!("Boot mode          {}", boot_name(&request.boot_mode)),
-            Control::Change(Setting::Boot),
-        ));
+        rows.push(if matches!(request.layout, DiskLayout::Alongside { .. }) {
+            Row::note("Boot mode          UEFI (required for this layout)")
+        } else {
+            Row::action(
+                format!("Boot mode          {}", boot_name(&request.boot_mode)),
+                Control::Change(Setting::Boot),
+            )
+        });
         if !matches!(request.layout, DiskLayout::Mounted { .. }) {
             rows.push(Row::action(
                 format!(
@@ -683,15 +734,11 @@ impl Ui {
                 &request.swap_gib.to_string(),
                 Field::Swap,
             ));
-            rows.push(Row::action(
-                "Refresh disk list",
-                Control::Send(Action::RefreshDisks),
-            ));
-            rows.push(Row::action(
-                "Edit disk partitions (cfdisk)",
-                Control::Choose(DeviceSlot::PartitionEditor),
-            ));
         }
+        rows.push(Row::action(
+            "Edit disk partitions (cfdisk)",
+            Control::Choose(DeviceSlot::PartitionEditor),
+        ));
         rows
     }
 
@@ -710,7 +757,7 @@ impl Ui {
         for module in active {
             rows.push(Row::note(format!(
                 "  {} · {} overrides",
-                module.module.path,
+                module_label(module, state.repositories.len()),
                 module.values.len()
             )));
             for option in &module.module.manifest.options {
@@ -769,6 +816,10 @@ impl Ui {
                 } else if let Some(plan) = &state.plan {
                     rows.insert(
                         0,
+                        Row::action("View full installation plan", Control::ShowPlan),
+                    );
+                    rows.insert(
+                        1,
                         Row::action(
                             "Apply installation plan…",
                             Control::Confirm(Action::ApplyInstall),
@@ -956,7 +1007,7 @@ impl Ui {
                 state.plan = None;
             }
             Some(Control::Choose(slot)) => {
-                let choices = device_choices(&state.disks, slot);
+                let choices = device_choices(&state.disks, &state.install.layout, slot);
                 if choices.is_empty() {
                     self.message = Some((
                         "No devices match this selection. Refresh the disk list.".into(),
@@ -973,6 +1024,15 @@ impl Ui {
             }
             Some(Control::Page(page)) => {
                 self.change_page(page);
+            }
+            Some(Control::ShowPlan) => {
+                if let Some(plan) = &state.plan {
+                    self.modal = Some(Modal::Notice {
+                        title: "Installation plan",
+                        text: plan.steps.join("\n\n"),
+                        offset: 0,
+                    });
+                }
             }
             Some(Control::Confirm(action)) => {
                 let word = match &action {
@@ -1133,7 +1193,11 @@ impl Ui {
                     self.modal = Some(Modal::Pick(picker));
                 }
             }
-            Modal::Notice { text, mut offset } => {
+            Modal::Notice {
+                title,
+                text,
+                mut offset,
+            } => {
                 match event {
                     Event::Key(27 | 10 | 13) => return Outcome::Continue,
                     Event::Key(KEY_UP | PAGE_UP) => offset = offset.saturating_sub(1),
@@ -1146,7 +1210,11 @@ impl Ui {
                     }
                     _ => {}
                 }
-                self.modal = Some(Modal::Notice { text, offset });
+                self.modal = Some(Modal::Notice {
+                    title,
+                    text,
+                    offset,
+                });
             }
         }
         Outcome::Continue
@@ -1282,7 +1350,14 @@ fn change_setting(request: &mut InstallRequest, setting: Setting) {
     match setting {
         Setting::Layout => {
             request.layout = match request.layout {
-                DiskLayout::Erase { .. } => DiskLayout::Partitions {
+                DiskLayout::Erase { .. } => {
+                    request.boot_mode = BootMode::Uefi;
+                    DiskLayout::Alongside {
+                        disk: String::new(),
+                        esp: None,
+                    }
+                }
+                DiskLayout::Alongside { .. } => DiskLayout::Partitions {
                     root: String::new(),
                     esp: None,
                     boot_disk: None,
@@ -1326,7 +1401,7 @@ fn change_setting(request: &mut InstallRequest, setting: Setting) {
     }
 }
 
-fn device_choices(devices: &[BlockDevice], slot: DeviceSlot) -> Vec<Choice> {
+fn device_choices(devices: &[BlockDevice], layout: &DiskLayout, slot: DeviceSlot) -> Vec<Choice> {
     fn visit(devices: &[BlockDevice], slot: DeviceSlot, choices: &mut Vec<Choice>) {
         for device in devices {
             let target = match slot {
@@ -1335,6 +1410,9 @@ fn device_choices(devices: &[BlockDevice], slot: DeviceSlot) -> Vec<Choice> {
                 }
                 DeviceSlot::Root => ["part", "crypt", "lvm"].contains(&device.kind.as_str()),
                 DeviceSlot::Esp => device.kind == "part",
+                DeviceSlot::AlongsideEsp => {
+                    device.kind == "part" && device.fstype.as_deref() == Some("vfat")
+                }
             };
             if target {
                 let size = format!("{:.1} GiB", device.size as f64 / 1024.0 / 1024.0 / 1024.0);
@@ -1355,13 +1433,32 @@ fn device_choices(devices: &[BlockDevice], slot: DeviceSlot) -> Vec<Choice> {
         }
     }
     let mut choices = Vec::new();
-    visit(devices, slot, &mut choices);
+    if let (DiskLayout::Alongside { disk, .. }, DeviceSlot::AlongsideEsp) = (layout, slot) {
+        choices.push(Choice {
+            value: String::new(),
+            label: "Create a dedicated EFI partition".into(),
+        });
+        if let Some(target) = devices.iter().find(|device| device.path == *disk) {
+            visit(&target.children, slot, &mut choices);
+        }
+    } else {
+        visit(devices, slot, &mut choices);
+    }
     choices
 }
 
 fn set_device(layout: &mut DiskLayout, slot: DeviceSlot, value: String) {
     match (layout, slot) {
         (DiskLayout::Erase { disk }, DeviceSlot::Disk) => *disk = value,
+        (DiskLayout::Alongside { disk, esp }, DeviceSlot::Disk) => {
+            if *disk != value {
+                *disk = value;
+                *esp = None;
+            }
+        }
+        (DiskLayout::Alongside { esp, .. }, DeviceSlot::AlongsideEsp) => {
+            *esp = (!value.is_empty()).then_some(value);
+        }
         (DiskLayout::Partitions { root, .. }, DeviceSlot::Root) => *root = value,
         (DiskLayout::Partitions { esp, .. }, DeviceSlot::Esp) => *esp = Some(value),
         (DiskLayout::Partitions { boot_disk, .. }, DeviceSlot::BootDisk) => {
@@ -1618,8 +1715,12 @@ impl Ui {
                         " Cancel ",
                     ));
                 }
-                Modal::Notice { text, offset } => {
-                    render_notice(frame, area, text, offset);
+                Modal::Notice {
+                    title,
+                    text,
+                    offset,
+                } => {
+                    render_notice(frame, area, title, text, offset);
                     self.cancel_hit = Some(button(
                         frame,
                         area.y + area.h - 2,
@@ -1718,6 +1819,7 @@ fn render_picker(
         DeviceSlot::Disk => "Choose installation disk",
         DeviceSlot::Root => "Choose root partition",
         DeviceSlot::Esp => "Choose EFI System Partition",
+        DeviceSlot::AlongsideEsp => "Dedicated or existing EFI partition",
         DeviceSlot::BootDisk => "Choose boot disk",
         DeviceSlot::PartitionEditor => "Select disk for cfdisk",
     };
@@ -1941,8 +2043,8 @@ fn button(frame: &mut FrameBuffer, y: i32, x: i32, title: &str) -> Area {
     area
 }
 
-fn render_notice(frame: &mut FrameBuffer, area: Area, text: &str, offset: &mut usize) {
-    box_panel(frame, area, "Action failed");
+fn render_notice(frame: &mut FrameBuffer, area: Area, title: &str, text: &str, offset: &mut usize) {
+    box_panel(frame, area, title);
     let width = (area.w - 4) as usize;
     let mut content = Vec::new();
     for message in text.lines() {
@@ -1967,7 +2069,7 @@ fn render_notice(frame: &mut FrameBuffer, area: Area, text: &str, offset: &mut u
             area.x + 2,
             width as i32,
             text,
-            if index == 0 { RED } else { TEXT },
+            TEXT,
             PANEL,
         );
     }
@@ -2123,6 +2225,31 @@ mod tests {
         ui.event(&mut state, Event::Text("PARTITION /dev/test".into()));
         assert!(
             matches!(ui.event(&mut state, Event::Key(13)), Outcome::Execute(Action::EditPartitions(path)) if path == "/dev/test")
+        );
+    }
+
+    #[test]
+    fn alongside_layout_requires_uefi_and_resets_efi_when_disk_changes() {
+        let mut request = session().install;
+        request.layout = DiskLayout::Erase {
+            disk: String::new(),
+        };
+        request.boot_mode = BootMode::Bios;
+        change_setting(&mut request, Setting::Layout);
+        assert_eq!(request.boot_mode, BootMode::Uefi);
+        set_device(&mut request.layout, DeviceSlot::Disk, "/dev/first".into());
+        set_device(
+            &mut request.layout,
+            DeviceSlot::AlongsideEsp,
+            "/dev/first1".into(),
+        );
+        set_device(&mut request.layout, DeviceSlot::Disk, "/dev/second".into());
+        assert_eq!(
+            request.layout,
+            DiskLayout::Alongside {
+                disk: "/dev/second".into(),
+                esp: None
+            }
         );
     }
 }

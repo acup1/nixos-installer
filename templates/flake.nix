@@ -5,7 +5,8 @@
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
   };
   outputs = { self, nixpkgs, home-manager, ... } @ inputs: let
-    cfg = import ./config.nix { inherit inputs; };
+    selector = builtins.getEnv "NIXOS_BASE_CONFIG";
+    cfg = import (if selector == "" then ./config.nix else builtins.toPath selector) { inherit inputs; };
     inherit (cfg) system username flakeDir;
     specialArgs = { inherit self inputs system username flakeDir; };
   in {

@@ -13,6 +13,9 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const ROOT_MINIMUM: u64 = 8 * GIB;
 const ESP_SIZE_MIB: u32 = 1024;
 const TARGET: &str = "/mnt";
+const EFI_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
+const LINUX_GUID: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
+const BIOS_GUID: &str = "21686148-6449-6e6f-744e-656564454649";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct BlockDevice {
@@ -50,6 +53,10 @@ fn deserialize_mountpoints<'de, D: serde::Deserializer<'de>>(
 pub enum DiskLayout {
     Erase {
         disk: String,
+    },
+    Alongside {
+        disk: String,
+        esp: Option<String>,
     },
     Partitions {
         root: String,
@@ -126,6 +133,48 @@ struct CheckedTarget {
     root: Option<DeviceIdentity>,
     esp: Option<DeviceIdentity>,
     mounts: Vec<Mount>,
+    alongside: Option<AlongsidePlan>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct Gpt {
+    label: String,
+    id: String,
+    device: String,
+    unit: String,
+    #[serde(rename = "firstlba")]
+    first_sector: u64,
+    #[serde(rename = "lastlba")]
+    last_sector: u64,
+    #[serde(rename = "sectorsize")]
+    sector_size: u64,
+    #[serde(default)]
+    partitions: Vec<GptPartition>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct GptPartition {
+    node: String,
+    start: u64,
+    size: u64,
+    #[serde(rename = "type")]
+    type_guid: String,
+    uuid: String,
+    #[serde(flatten)]
+    attributes: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Extent {
+    start: u64,
+    size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AlongsidePlan {
+    present: Gpt,
+    new_esp: Option<Extent>,
+    new_root: Extent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +250,7 @@ pub fn build_plan(request: InstallRequest) -> Result<InstallPlan, String> {
 pub fn confirmation_token(plan: &InstallPlan) -> String {
     match &plan.approved_request.layout {
         DiskLayout::Erase { disk } => format!("ERASE {disk}"),
+        DiskLayout::Alongside { disk, .. } => format!("INSTALL ALONGSIDE {disk}"),
         DiskLayout::Partitions {
             root,
             esp,
@@ -212,10 +262,8 @@ pub fn confirmation_token(plan: &InstallPlan) -> String {
             if *format_root {
                 formatted.push(root.as_str());
             }
-            if *format_esp {
-                if let Some(esp) = esp {
-                    formatted.push(esp.as_str());
-                }
+            if *format_esp && let Some(esp) = esp {
+                formatted.push(esp.as_str());
             }
             if formatted.is_empty() {
                 format!("INSTALL {root}")
@@ -330,6 +378,7 @@ fn inspect_target(
         root: None,
         esp: None,
         mounts: Vec::new(),
+        alongside: None,
     };
     let required_root_size = ROOT_MINIMUM + u64::from(request.swap_gib) * GIB;
 
@@ -344,6 +393,36 @@ fn inspect_target(
                 ));
             }
             require_unused_target(&checked.target, current_mounts)?;
+            checked.boot_disk = Some(identity(device)?);
+        }
+        DiskLayout::Alongside { disk, esp } => {
+            if request.boot_mode != BootMode::Uefi {
+                return Err("Guided alongside installation requires UEFI and a GPT disk.".into());
+            }
+            let device = lookup(devices, disk)?;
+            require_kind(device, "disk")?;
+            require_idle_tree(device)?;
+            require_unused_target(&checked.target, current_mounts)?;
+            if let Some(esp) = esp {
+                let partition = lookup(devices, esp)?;
+                require_kind(partition, "part")?;
+                if parent_disk(devices, partition)?.number != device.number
+                    || !is_efi_partition(partition)
+                    || partition.fstype.as_deref() != Some("vfat")
+                    || partition.size < 256 * 1024 * 1024
+                {
+                    return Err(format!(
+                        "{esp} must be a FAT EFI partition of at least 256 MiB on {disk}."
+                    ));
+                }
+                checked.esp = Some(identity(partition)?);
+            }
+            checked.alongside = Some(plan_alongside(
+                read_gpt(disk)?,
+                device.size,
+                required_root_size,
+                esp.is_none(),
+            )?);
             checked.boot_disk = Some(identity(device)?);
         }
         DiskLayout::Partitions {
@@ -500,18 +579,143 @@ fn inspect_target(
 
 fn is_efi_partition(device: &BlockDevice) -> bool {
     device.parttype.as_deref().is_some_and(|value| {
-        value.eq_ignore_ascii_case("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
-            || value.eq_ignore_ascii_case("0xef")
+        value.eq_ignore_ascii_case(EFI_GUID) || value.eq_ignore_ascii_case("0xef")
     })
+}
+
+fn read_gpt(disk: &str) -> Result<Gpt, String> {
+    #[derive(Deserialize)]
+    struct TableOutput {
+        partitiontable: Gpt,
+    }
+    let json = capture("sfdisk", ["--json", "--", disk])?;
+    let table: TableOutput = serde_json::from_slice(&json)
+        .map_err(|error| format!("Cannot read GPT geometry for {disk}: {error}"))?;
+    if table.partitiontable.device != disk || table.partitiontable.label != "gpt" {
+        return Err(format!(
+            "{disk} does not have a supported GPT partition table."
+        ));
+    }
+    Ok(table.partitiontable)
+}
+
+fn plan_alongside(
+    present: Gpt,
+    disk_bytes: u64,
+    root_bytes: u64,
+    create_esp: bool,
+) -> Result<AlongsidePlan, String> {
+    const MIB: u64 = 1024 * 1024;
+    let sector = present.sector_size;
+    if present.label != "gpt"
+        || present.unit != "sectors"
+        || !matches!(sector, 512 | 1024 | 2048 | 4096)
+        || !disk_bytes.is_multiple_of(sector)
+        || present.first_sector < 2
+        || present.first_sector > present.last_sector
+        || present.last_sector >= disk_bytes / sector
+    {
+        return Err("Invalid usable sector range or sector size reported for GPT.".into());
+    }
+    let alignment = MIB / sector;
+    let end = present.last_sector + 1;
+    let mut occupied: Vec<_> = present.partitions.iter().collect();
+    occupied.sort_by_key(|part| part.start);
+    let mut cursor = present.first_sector;
+    let mut largest = Extent { start: 0, size: 0 };
+    let mut consider_gap = |from: u64, to: u64| {
+        let start = from.div_ceil(alignment) * alignment;
+        let end = to / alignment * alignment;
+        let size = end.saturating_sub(start);
+        if size > largest.size {
+            largest = Extent { start, size };
+        }
+    };
+    for partition in occupied {
+        let after = partition
+            .start
+            .checked_add(partition.size)
+            .ok_or("GPT range overflow.")?;
+        if partition.size == 0 || partition.start < cursor || after > end {
+            return Err("The GPT contains overlapping or out-of-bounds partitions.".into());
+        }
+        consider_gap(cursor, partition.start);
+        cursor = after;
+    }
+    consider_gap(cursor, end);
+    let esp_sectors = if create_esp {
+        u64::from(ESP_SIZE_MIB) * MIB / sector
+    } else {
+        0
+    };
+    if largest.size < esp_sectors + root_bytes.div_ceil(sector) {
+        return Err("No contiguous unallocated GPT space is large enough. Existing partitions are left unchanged.".into());
+    }
+    Ok(AlongsidePlan {
+        present,
+        new_esp: create_esp.then_some(Extent {
+            start: largest.start,
+            size: esp_sectors,
+        }),
+        new_root: Extent {
+            start: largest.start + esp_sectors,
+            size: largest.size - esp_sectors,
+        },
+    })
+}
+
+fn verify_append<'a>(
+    planned: &AlongsidePlan,
+    updated: &'a Gpt,
+) -> Result<(&'a GptPartition, Option<&'a GptPartition>), String> {
+    let old = &planned.present;
+    let additions = 1 + usize::from(planned.new_esp.is_some());
+    if updated.label != old.label
+        || updated.id != old.id
+        || updated.device != old.device
+        || updated.unit != old.unit
+        || updated.first_sector != old.first_sector
+        || updated.last_sector != old.last_sector
+        || updated.sector_size != old.sector_size
+        || updated.partitions.len() != old.partitions.len() + additions
+        || !old
+            .partitions
+            .iter()
+            .all(|part| updated.partitions.contains(part))
+    {
+        return Err("The partition table differs from the approved additions. No new partitions will be formatted.".into());
+    }
+    let lookup = |extent: Extent, guid: &str| {
+        updated
+            .partitions
+            .iter()
+            .find(|part| {
+                part.start == extent.start
+                    && part.size == extent.size
+                    && part.type_guid.eq_ignore_ascii_case(guid)
+                    && !old
+                        .partitions
+                        .iter()
+                        .any(|old| old.node == part.node || old.uuid == part.uuid)
+            })
+            .ok_or("A new partition did not match the approved geometry.")
+    };
+    let root = lookup(planned.new_root, LINUX_GUID)?;
+    let esp = planned
+        .new_esp
+        .map(|extent| lookup(extent, EFI_GUID))
+        .transpose()?;
+    Ok((root, esp))
 }
 
 fn require_bios_partition(disk: &BlockDevice) -> Result<(), String> {
     let valid = match disk.pttype.as_deref() {
         Some("dos") => true,
         Some("gpt") => disk.children.iter().any(|partition| {
-            partition.parttype.as_deref().is_some_and(|value| {
-                value.eq_ignore_ascii_case("21686148-6449-6e6f-744e-656564454649")
-            })
+            partition
+                .parttype
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(BIOS_GUID))
         }),
         _ => false,
     };
@@ -545,7 +749,7 @@ fn mount_device<'a>(devices: &'a [BlockDevice], mount: &Mount) -> Option<&'a Blo
         }
         let path = fs::canonicalize(&mount.source).ok()?;
         let metadata = fs::metadata(path).ok()?;
-        metadata.file_type().is_block_device().then(|| ())?;
+        metadata.file_type().is_block_device().then_some(())?;
         lookup_number(devices, &device_number(metadata.rdev()))
     })
 }
@@ -890,6 +1094,31 @@ fn describe_steps(request: &InstallRequest, checked: &CheckedTarget) -> Vec<Stri
                 }
             });
         }
+        DiskLayout::Alongside { disk, esp } => {
+            let alongside = checked
+                .alongside
+                .as_ref()
+                .expect("validated alongside geometry");
+            let range = alongside.new_root;
+            steps.push(format!(
+                "Add a root partition on {disk} in unallocated GPT sectors {}–{} ({} GiB). Existing partitions will not be resized or formatted.",
+                range.start,
+                range.start + range.size - 1,
+                range.size * alongside.present.sector_size / GIB,
+            ));
+            if let Some(esp) = esp {
+                steps.push(format!(
+                    "Keep the existing EFI partition {esp} and add a separate GRUB boot entry."
+                ));
+            } else if let Some(region) = alongside.new_esp {
+                steps.push(format!(
+                    "Add a new {} MiB EFI partition in GPT sectors {}–{}.",
+                    ESP_SIZE_MIB,
+                    region.start,
+                    region.start + region.size - 1
+                ));
+            }
+        }
         DiskLayout::Partitions {
             root,
             esp,
@@ -939,6 +1168,7 @@ fn describe_steps(request: &InstallRequest, checked: &CheckedTarget) -> Vec<Stri
         checked.target.display(),
         request.filesystem.name(),
         match request.boot_mode {
+            BootMode::Uefi if shared_esp(request) => "UEFI GRUB with a separate boot entry",
             BootMode::Uefi => "UEFI systemd-boot",
             BootMode::Bios => "BIOS GRUB",
         }
@@ -1029,6 +1259,18 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
                 tools.push("mkfs.fat");
             }
         }
+        DiskLayout::Alongside { esp, .. } => {
+            tools.extend([
+                "sfdisk",
+                "udevadm",
+                "mount",
+                "umount",
+                request.filesystem.formatter(),
+            ]);
+            if esp.is_none() {
+                tools.push("mkfs.fat");
+            }
+        }
         DiskLayout::Partitions {
             format_root,
             format_esp,
@@ -1071,10 +1313,23 @@ fn install(
     let (format_root, format_esp) = match request.layout {
         DiskLayout::Erase { .. } => {
             let approved_disk = checked.boot_disk.as_ref().ok_or("Missing approved disk.")?;
-            ensure_same_idle(approved_disk)?;
-            partition_disk(&approved_disk.record.path, request.boot_mode)?;
+            partition_disk(approved_disk, request.boot_mode)?;
             (root, esp) = wait_partitions(approved_disk, request.boot_mode)?;
             (true, request.boot_mode == BootMode::Uefi)
+        }
+        DiskLayout::Alongside { .. } => {
+            let approved_disk = checked.boot_disk.as_ref().ok_or("Missing approved disk.")?;
+            let planned = checked
+                .alongside
+                .as_ref()
+                .ok_or("Missing approved GPT geometry.")?;
+            let (new_root, new_esp) = append_partitions(approved_disk, planned)?;
+            root = Some(new_root);
+            let format_esp = new_esp.is_some();
+            if let Some(new_esp) = new_esp {
+                esp = Some(new_esp);
+            }
+            (true, format_esp)
         }
         DiskLayout::Partitions {
             format_root,
@@ -1144,6 +1399,9 @@ fn install(
         return Err("The target mount changed after review.".into());
     }
     require_fresh_target(target)?;
+    if shared_esp(request) {
+        verify_shared_esp(target, &request.hostname)?;
+    }
     if request.swap_gib > 0 {
         create_swap(target, request)?;
     }
@@ -1259,20 +1517,33 @@ fn stable_disk_path(device: &DeviceIdentity) -> String {
         .unwrap_or_else(|| device.record.path.clone())
 }
 
-fn partition_disk(disk: &str, boot: BootMode) -> Result<(), String> {
+fn partition_disk(disk: &DeviceIdentity, boot: BootMode) -> Result<(), String> {
     let boot_partition = match boot {
-        BootMode::Uefi => format!("size={}MiB, type=U", ESP_SIZE_MIB),
-        BootMode::Bios => "size=4MiB, type=21686148-6449-6E6F-744E-656564454649".into(),
+        BootMode::Uefi => format!("size={ESP_SIZE_MIB}MiB, type={EFI_GUID}"),
+        BootMode::Bios => format!("size=4MiB, type={BIOS_GUID}"),
     };
-    let layout = format!("label: gpt\nunit: sectors\n\n{boot_partition}\ntype=L\n");
+    let layout = format!("label: gpt\nunit: sectors\n\n{boot_partition}\ntype={LINUX_GUID}\n");
+    let path = &disk.record.path;
+    ensure_same_idle(disk)?;
+    write_partition_table(
+        path,
+        &["--no-act", "--wipe=always", "--wipe-partitions=always"],
+        &layout,
+    )?;
+    ensure_same_idle(disk)?;
+    write_partition_table(
+        path,
+        &["--wipe=always", "--wipe-partitions=always"],
+        &layout,
+    )?;
+    command("udevadm", ["settle"])
+}
+
+fn write_partition_table(disk: &str, args: &[&str], layout: &str) -> Result<(), String> {
     let mut child = Command::new("sfdisk")
-        .args([
-            "--lock=yes",
-            "--wipe=always",
-            "--wipe-partitions=always",
-            "--",
-            disk,
-        ])
+        .arg("--lock=yes")
+        .args(args)
+        .args(["--", disk])
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Cannot start sfdisk: {error}"))?;
@@ -1288,13 +1559,89 @@ fn partition_disk(disk: &str, boot: BootMode) -> Result<(), String> {
     if !status.success() {
         return Err(format!("sfdisk failed on {disk} ({status})."));
     }
-    command("udevadm", ["settle"])?;
     Ok(())
+}
+
+fn append_partitions(
+    disk: &DeviceIdentity,
+    plan: &AlongsidePlan,
+) -> Result<(DeviceIdentity, Option<DeviceIdentity>), String> {
+    let path = disk.record.path.as_str();
+    let line = |range: Extent, guid: &str| {
+        format!("start={}, size={}, type={guid}\n", range.start, range.size)
+    };
+    let mut layout = String::new();
+    if let Some(esp) = plan.new_esp {
+        layout.push_str(&line(esp, EFI_GUID));
+    }
+    layout.push_str(&line(plan.new_root, LINUX_GUID));
+    let args = ["--append", "--wipe=never", "--wipe-partitions=never"];
+    let mut dry_run = args.to_vec();
+    dry_run.push("--no-act");
+    ensure_same_idle(disk)?;
+    write_partition_table(path, &dry_run, &layout)?;
+    ensure_same_idle(disk)?;
+    if read_gpt(path)? != plan.present {
+        return Err("The GPT changed after review. Review a fresh plan.".into());
+    }
+    write_partition_table(path, &args, &layout)?;
+    command("udevadm", ["settle"])?;
+
+    let updated = read_gpt(path)?;
+    let (root, esp) = verify_append(plan, &updated)?;
+    let devices = probe()?;
+    let current = identity(lookup(&devices, path)?)?;
+    if current.number != disk.number
+        || current.kernel_path != disk.kernel_path
+        || current.record.size != disk.record.size
+        || current.record.serial != disk.record.serial
+        || current.record.wwn != disk.record.wwn
+    {
+        return Err("The disk changed while adding the new partitions.".into());
+    }
+    let identify = |partition: &GptPartition| -> Result<DeviceIdentity, String> {
+        let record = lookup(&devices, &partition.node)?;
+        require_kind(record, "part")?;
+        let identity = identity(record)?;
+        let start = fs::read_to_string(identity.kernel_path.join("start"))
+            .map_err(|error| format!("Cannot read kernel partition start: {error}"))?;
+        let offset = partition.start * updated.sector_size / 512;
+        if start.trim().parse::<u64>().ok() != Some(offset)
+            || record.size != partition.size * updated.sector_size
+            || !record
+                .partuuid
+                .as_deref()
+                .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&partition.uuid))
+            || parent_disk(&devices, record)?.number != current.record.number
+        {
+            return Err(format!(
+                "Kernel partition {} does not match the approved GPT entry.",
+                partition.node
+            ));
+        }
+        require_idle_tree(record)?;
+        Ok(identity)
+    };
+    Ok((identify(root)?, esp.map(identify).transpose()?))
 }
 
 type PartitionDevices = (Option<DeviceIdentity>, Option<DeviceIdentity>);
 
 fn wait_partitions(disk: &DeviceIdentity, boot: BootMode) -> Result<PartitionDevices, String> {
+    let table = read_gpt(&disk.record.path)?;
+    let [boot_entry, root_entry] = table.partitions.as_slice() else {
+        return Err("The new GPT does not have the expected two partitions.".into());
+    };
+    let boot_guid = if boot == BootMode::Uefi {
+        EFI_GUID
+    } else {
+        BIOS_GUID
+    };
+    if !boot_entry.type_guid.eq_ignore_ascii_case(boot_guid)
+        || !root_entry.type_guid.eq_ignore_ascii_case(LINUX_GUID)
+    {
+        return Err("The new GPT has unexpected partition types.".into());
+    }
     for _ in 0..20 {
         let devices = probe()?;
         let current = lookup(&devices, &disk.record.path)?;
@@ -1321,8 +1668,10 @@ fn wait_partitions(disk: &DeviceIdentity, boot: BootMode) -> Result<PartitionDev
                         format!("Cannot verify new partition {}: {error}", child.path)
                     })?;
                 match number.trim() {
-                    "2" if child.size >= ROOT_MINIMUM => root = Some(child_identity),
-                    "1" if boot == BootMode::Uefi && is_efi_partition(child) => {
+                    "2" if matches_gpt_part(child, root_entry) && child.size >= ROOT_MINIMUM => {
+                        root = Some(child_identity)
+                    }
+                    "1" if boot == BootMode::Uefi && matches_gpt_part(child, boot_entry) => {
                         esp = Some(child_identity)
                     }
                     _ => {}
@@ -1335,6 +1684,14 @@ fn wait_partitions(disk: &DeviceIdentity, boot: BootMode) -> Result<PartitionDev
         thread::sleep(Duration::from_millis(250));
     }
     Err("The new partitions were not visible to the kernel.".into())
+}
+
+fn matches_gpt_part(device: &BlockDevice, partition: &GptPartition) -> bool {
+    device.path == partition.node
+        && device
+            .partuuid
+            .as_deref()
+            .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&partition.uuid))
 }
 
 #[derive(Default)]
@@ -1471,12 +1828,54 @@ fn create_swap(target: &Path, request: &InstallRequest) -> Result<(), String> {
     }
 }
 
+fn shared_esp(request: &InstallRequest) -> bool {
+    request.boot_mode == BootMode::Uefi
+        && matches!(
+            request.layout,
+            DiskLayout::Alongside { esp: Some(_), .. }
+                | DiskLayout::Partitions {
+                    format_esp: false,
+                    ..
+                }
+                | DiskLayout::Mounted { .. }
+        )
+}
+
+fn efi_id(hostname: &str) -> String {
+    format!("nixos-{}", hostname.to_ascii_lowercase())
+}
+
+fn verify_shared_esp(target: &Path, hostname: &str) -> Result<(), String> {
+    let boot = target.join("boot");
+    for path in [
+        boot.join("grub"),
+        boot.join("kernels"),
+        boot.join("EFI").join(efi_id(hostname)),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(format!(
+                    "{} already exists on the shared EFI partition. Use a dedicated EFI partition to preserve the existing bootloader.",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot inspect {}: {error}", path.display())),
+        }
+    }
+    Ok(())
+}
+
 fn configuration(
     request: &InstallRequest,
     boot_disk: Option<&str>,
     state_version: &str,
 ) -> Result<String, String> {
     let boot = match request.boot_mode {
+        BootMode::Uefi if shared_esp(request) => {
+            let bootloader_id = efi_id(&request.hostname);
+            format!("  boot.loader.systemd-boot.enable = lib.mkForce false;\n  boot.loader.grub.enable = lib.mkForce true;\n  boot.loader.grub.efiSupport = lib.mkForce true;\n  boot.loader.grub.efiInstallAsRemovable = lib.mkForce false;\n  boot.loader.grub.devices = lib.mkForce [];\n  boot.loader.grub.mirroredBoots = lib.mkForce [ {{ path = \"/boot\"; devices = [ \"nodev\" ]; efiBootloaderId = \"{bootloader_id}\"; }} ];\n  boot.loader.efi.canTouchEfiVariables = true;\n")
+        }
         BootMode::Uefi => "  boot.loader.systemd-boot.enable = lib.mkForce true;\n  boot.loader.grub.enable = lib.mkForce false;\n  boot.loader.efi.canTouchEfiVariables = true;\n".into(),
         BootMode::Bios => {
             let disk = boot_disk.ok_or("The BIOS boot disk was not validated.")?;
@@ -1591,6 +1990,7 @@ fn command<T: AsRef<OsStr>>(
 ) -> Result<(), String> {
     let status = Command::new(program)
         .args(args)
+        .env_remove("NIXOS_BASE_CONFIG")
         .status()
         .map_err(|error| format!("Cannot run {program}: {error}"))?;
     if status.success() {
@@ -1629,6 +2029,7 @@ mod tests {
             root: None,
             esp: None,
             mounts: Vec::new(),
+            alongside: None,
         };
         InstallPlan {
             approved_request: request.clone(),
@@ -1666,6 +2067,69 @@ mod tests {
         });
         assert_eq!(confirmation_token(&erase), "ERASE /dev/sda");
         assert_eq!(confirmation_token(&mounted), "INSTALL /mnt/nixos");
+    }
+
+    fn gpt_fixture(sector_size: u64) -> Gpt {
+        Gpt {
+            label: "gpt".into(),
+            id: "3E517A10-ED75-4424-9FFF-71DE67FB7D25".into(),
+            device: "/dev/sda".into(),
+            unit: "sectors".into(),
+            first_sector: 34,
+            last_sector: 64 * GIB / sector_size - 34,
+            sector_size,
+            partitions: vec![GptPartition {
+                node: "/dev/sda1".into(),
+                start: 1024 * 1024 / sector_size,
+                size: 16 * GIB / sector_size,
+                type_guid: EFI_GUID.into(),
+                uuid: "OLD".into(),
+                attributes: [("name".into(), "System".into())].into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn alongside_uses_aligned_gpt_space_without_resizing_existing_partitions() {
+        for sector in [512, 4096] {
+            let gpt = gpt_fixture(sector);
+            let original = gpt.partitions[0].clone();
+            let plan = plan_alongside(gpt.clone(), 64 * GIB, ROOT_MINIMUM, true).unwrap();
+            let efi = plan.new_esp.unwrap();
+            let root = plan.new_root;
+            assert_eq!(efi.start, original.start + original.size);
+            assert_eq!(efi.size * sector, GIB);
+            assert_eq!(root.start, efi.start + efi.size);
+            assert_eq!(root.start * sector % (1024 * 1024), 0);
+            assert!(root.start + root.size <= gpt.last_sector + 1);
+
+            let mut after = gpt.clone();
+            let new = |node: &str, extent: Extent, guid: &str| GptPartition {
+                node: node.into(),
+                start: extent.start,
+                size: extent.size,
+                type_guid: guid.into(),
+                uuid: node.into(),
+                attributes: Default::default(),
+            };
+            after.partitions.push(new("/dev/sda2", efi, EFI_GUID));
+            after.partitions.push(new("/dev/sda3", root, LINUX_GUID));
+            assert_eq!(verify_append(&plan, &after).unwrap().0.node, "/dev/sda3");
+            after.partitions[0].size -= 1;
+            assert!(verify_append(&plan, &after).is_err());
+        }
+    }
+
+    #[test]
+    fn alongside_rejects_invalid_geometry_and_insufficient_free_space() {
+        let gpt = gpt_fixture(512);
+        assert!(plan_alongside(gpt.clone(), 64 * GIB, 48 * GIB, false).is_err());
+        let mut overlapping = gpt.clone();
+        overlapping.partitions.push(gpt.partitions[0].clone());
+        assert!(plan_alongside(overlapping, 64 * GIB, ROOT_MINIMUM, false).is_err());
+        let mut outside = gpt;
+        outside.partitions[0].size = u64::MAX;
+        assert!(plan_alongside(outside, 64 * GIB, ROOT_MINIMUM, false).is_err());
     }
 
     #[test]
@@ -1741,6 +2205,18 @@ mod tests {
             "boot.loader.grub.devices = lib.mkForce [ \"/dev/disk/by-id/ata-fixture\" ]"
         ));
         assert!(bios.contains("system.stateVersion = \"26.05\""));
+    }
+
+    #[test]
+    fn shared_efi_uses_distinct_loader_with_no_removable_fallback_overwrite() {
+        let request = request(DiskLayout::Alongside {
+            disk: "/dev/sda".into(),
+            esp: Some("/dev/sda1".into()),
+        });
+        let output = configuration(&request, None, "26.05").unwrap();
+        assert!(output.contains("efiBootloaderId = \"nixos-workstation\""));
+        assert!(output.contains("efiInstallAsRemovable = lib.mkForce false"));
+        assert!(output.contains("systemd-boot.enable = lib.mkForce false"));
     }
 
     #[test]
