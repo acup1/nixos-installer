@@ -3,7 +3,7 @@ set -eu
 umask 077
 
 # Checked against Cargo.toml and the Git tag by the release workflow.
-release='v0.4.0'
+release='v0.4.1'
 case "$(uname -s)" in
     Linux) os=linux ;;
     Darwin) os=darwin ;;

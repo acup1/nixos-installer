@@ -1194,16 +1194,25 @@ impl RebuildTarget {
         command
     }
 
-    pub fn rebuild(&self, selector: &Path) -> Result<()> {
+    pub fn rebuild(&self, selector: &Path, gc_after_rebuild: bool) -> Result<()> {
         let status = self
             .command(selector)
             .status()
             .map_err(|e| format!("nh: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("nh exited with {status}"))
+        if !status.success() {
+            return Err(format!("nh exited with {status}"));
         }
+        if gc_after_rebuild {
+            let status = Command::new("nix-collect-garbage")
+                .status()
+                .map_err(|e| format!("System rebuilt. Could not start nix-collect-garbage: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "System rebuilt. nix-collect-garbage exited with {status}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

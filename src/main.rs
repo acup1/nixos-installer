@@ -29,6 +29,7 @@ struct Saved {
     flake: String,
     flake_override: String,
     selector: String,
+    gc_after_rebuild: bool,
 }
 
 fn detected_flake(selector: Option<&Selector>, saved: &Saved, path: &str) -> Result<String> {
@@ -386,6 +387,7 @@ impl Controller {
             selector: s.selector.clone(),
             flake: s.host_flake().to_owned(),
             flake_override: s.flake.clone(),
+            gc_after_rebuild: s.gc_after_rebuild,
         }
     }
     fn synchronized_state(&self, state: &Session, target: bool) -> Saved {
@@ -672,8 +674,12 @@ impl Controller {
                     config::RebuildTarget::resolve(state.host_flake(), path)
                 })?;
                 self.save(state)?;
-                target.rebuild(Path::new(&state.selector))?;
-                Ok("System rebuilt".into())
+                target.rebuild(Path::new(&state.selector), state.gc_after_rebuild)?;
+                Ok(if state.gc_after_rebuild {
+                    "System rebuilt and garbage collection completed".into()
+                } else {
+                    "System rebuilt".into()
+                })
             }
         }
     }
@@ -1326,7 +1332,9 @@ fn run() -> Result<()> {
             request.username = username;
         }
     }
-    let state = Session::new(mode, repositories, request, flake, selector);
+    let mut state = Session::new(mode, repositories, request, flake, selector);
+    state.gc_after_rebuild =
+        mode == Mode::Configure && state.selector == saved.selector && saved.gc_after_rebuild;
     let controller = Controller {
         dir,
         sources: vec![],

@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
     env, fs, io,
-    os::unix::fs::PermissionsExt,
+    os::{fd::AsRawFd, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
 };
 use terminalib::{
@@ -50,6 +50,7 @@ pub struct Session {
     pub disks: Vec<BlockDevice>,
     pub plan: Option<InstallPlan>,
     pub catalog_warning: Option<String>,
+    pub gc_after_rebuild: bool,
 }
 
 impl Session {
@@ -75,6 +76,7 @@ impl Session {
             disks: Vec::new(),
             plan: None,
             catalog_warning: None,
+            gc_after_rebuild: false,
         }
     }
 
@@ -131,6 +133,7 @@ pub enum Action {
 const BACK_TAB: i32 = -1;
 const PAGE_UP: i32 = -2;
 const PAGE_DOWN: i32 = -3;
+const CTRL_C: i32 = 3;
 
 const BG: Rgb = Rgb::new(12, 17, 28);
 const PANEL: Rgb = Rgb::new(25, 32, 50);
@@ -229,6 +232,7 @@ enum Control {
     SelectModule(usize),
     ToggleParameter(usize, Vec<usize>),
     ResetParameter(usize, usize),
+    ToggleGarbageCollection,
     AddRepository,
     ToggleSource(usize),
     RemoveRepository(usize),
@@ -584,11 +588,30 @@ pub fn run<T: Send + 'static>(
 fn open_terminal() -> io::Result<Terminal> {
     let mut terminal = Terminal::wannajustwork()?;
     terminal.enable_bracketed_paste()?;
+    // Read Ctrl+C as input while the TUI is active. Terminal::restore restores
+    // the original interrupt character before a child command or on exit.
+    let fd = terminal.stdin.as_raw_fd();
+    let disabled = unsafe { libc::fpathconf(fd, libc::_PC_VDISABLE) };
+    if disabled == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut termios = unsafe { termios.assume_init() };
+    termios.c_cc[libc::VINTR] = disabled as libc::cc_t;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(terminal)
 }
 
 fn read_event(terminal: &mut Terminal) -> io::Result<Event> {
     let key = terminal.get_key(100, false)?;
+    if key == CTRL_C {
+        return Ok(Event::Key(CTRL_C));
+    }
     if key == MOUSE_EVENT {
         return Ok(Event::Mouse(terminal.getmouse()));
     }
@@ -1110,6 +1133,7 @@ impl Ui {
         match state.mode {
             Mode::Configure => {
                 let selector_valid = PathBuf::from(&state.selector).is_absolute();
+                let can_rebuild = selector_valid && !state.host_flake().trim().is_empty();
                 rows.insert(
                     0,
                     if selector_valid {
@@ -1122,12 +1146,26 @@ impl Ui {
                 );
                 rows.insert(
                     1,
-                    if selector_valid && !state.host_flake().trim().is_empty() {
+                    if can_rebuild {
                         Row::action("Rebuild", Control::Send(Action::Rebuild))
                     } else {
                         Row::note("Rebuild unavailable · load a selector with flakeDir")
                     },
                 );
+                if can_rebuild {
+                    let mark = if state.gc_after_rebuild {
+                        "[×]"
+                    } else {
+                        "[ ]"
+                    };
+                    rows.insert(
+                        2,
+                        Row::action(
+                            format!("{mark} Run garbage collection after rebuild"),
+                            Control::ToggleGarbageCollection,
+                        ),
+                    );
+                }
             }
             Mode::Install => {
                 rows.push(Row::note(format!(
@@ -1195,6 +1233,9 @@ impl Ui {
     }
 
     fn event(&mut self, state: &mut Session, event: Event) -> Outcome {
+        if matches!(event, Event::Key(CTRL_C)) {
+            return Outcome::Quit;
+        }
         if self.loading {
             return match event {
                 Event::Key(27) => Outcome::Quit,
@@ -1369,6 +1410,9 @@ impl Ui {
             }
             Some(Control::ResetParameter(row, parameter)) => {
                 reset_parameter(state, row, parameter);
+            }
+            Some(Control::ToggleGarbageCollection) => {
+                state.gc_after_rebuild = !state.gc_after_rebuild;
             }
             Some(Control::AddRepository) => {
                 state.repositories.push(SourceSpec {
@@ -1784,6 +1828,7 @@ impl Ui {
                     state.saved_identity = Identity::default();
                     state.inherited_identity = Identity::default();
                     state.suggested_identity = Identity::default();
+                    state.gc_after_rebuild = false;
                     self.catalog_dirty = true;
                 }
             }
@@ -2186,9 +2231,9 @@ impl Ui {
                 self.page + 1,
             ));
         }
-        self.exit_hit = Some(button(frame, nav_y, width / 2 - 5, " Esc  Exit "));
+        self.exit_hit = Some(button(frame, nav_y, width / 2 - 8, " Esc/Ctrl+C Exit "));
         let bottom = if self.loading {
-            ("Loading module sources…   Esc Exit".into(), BLUE)
+            ("Loading module sources…   Esc/Ctrl+C Exit".into(), BLUE)
         } else if self.message.as_ref().is_none_or(|(_, success)| *success)
             && state
                 .repositories
@@ -2207,7 +2252,7 @@ impl Ui {
             )
         } else {
             (
-                "↑↓ Move   Enter Open   Ctrl+N/P Step   Esc Exit".into(),
+                "↑↓ Move   Enter Open   Ctrl+N/P Step   Esc/Ctrl+C Exit".into(),
                 MUTED,
             )
         };
@@ -2861,6 +2906,47 @@ mod tests {
             Outcome::Execute(Action::Rebuild)
         ));
         assert!(ui.modal.is_none());
+    }
+
+    #[test]
+    fn review_has_an_opt_in_garbage_collection_switch() {
+        let mut state = session();
+        let mut ui = Ui {
+            page: CONFIG_PAGES.len() - 1,
+            focus: 2,
+            ..Ui::default()
+        };
+        assert!(ui.rows(&state)[2].text.starts_with("[ ]"));
+        assert!(matches!(
+            ui.event(&mut state, Event::Key(13)),
+            Outcome::Continue
+        ));
+        assert!(state.gc_after_rebuild);
+        assert!(ui.rows(&state)[2].text.starts_with("[×]"));
+        assert!(matches!(
+            ui.event(&mut state, Event::Text(" ".into())),
+            Outcome::Continue
+        ));
+        assert!(!state.gc_after_rebuild);
+    }
+
+    #[test]
+    fn ctrl_c_exits_during_loading_and_in_a_modal() {
+        let mut state = session();
+        let mut ui = Ui {
+            loading: true,
+            ..Ui::default()
+        };
+        assert!(matches!(
+            ui.event(&mut state, Event::Key(CTRL_C)),
+            Outcome::Quit
+        ));
+        ui.loading = false;
+        ui.failure("Test notice", "Example error".into());
+        assert!(matches!(
+            ui.event(&mut state, Event::Key(CTRL_C)),
+            Outcome::Quit
+        ));
     }
 
     #[test]
