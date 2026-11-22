@@ -71,7 +71,7 @@ struct Controller {
     selector: Option<Selector>,
     inspected_host: String,
     manual: BTreeMap<(usize, String), String>,
-    unavailable: Vec<String>,
+    sources_unavailable: bool,
 }
 impl Controller {
     fn selections(&self, state: &Session) -> Vec<Selected> {
@@ -268,7 +268,7 @@ impl Controller {
                 )
             ))
         };
-        self.unavailable = unavailable;
+        self.sources_unavailable = !unavailable.is_empty();
         state.modules = rows;
         state.plan = None;
         Ok(format!(
@@ -278,7 +278,7 @@ impl Controller {
         ))
     }
     fn choices(&self, state: &Session) -> Result<Vec<Choice>> {
-        if !self.unavailable.is_empty() {
+        if self.sources_unavailable {
             return Err(
                 "Fix unavailable module sources and refresh before applying changes.".into(),
             );
@@ -666,7 +666,19 @@ fn add_local_sources(
     let mut registered: BTreeSet<PathBuf> = repositories
         .iter()
         .filter(|source| source.mode == SourceMode::Local)
-        .filter_map(|source| Path::new(&source.repository).canonicalize().ok())
+        .filter_map(|source| {
+            let path = PathBuf::from(&source.repository);
+            let root = path.canonicalize().unwrap_or(path);
+            let reference = source.reference.as_str();
+            let working_tree = matches!(reference, "" | "HEAD")
+                || (root.join(".git").exists()
+                    && git_output(&root, &["symbolic-ref", "--quiet", "HEAD"]).is_some_and(
+                        |head| {
+                            head == reference || head.strip_prefix("refs/heads/") == Some(reference)
+                        },
+                    ));
+            working_tree.then_some(root)
+        })
         .collect();
     for repository in explicit {
         let path = PathBuf::from(repository);
@@ -1253,7 +1265,7 @@ fn run() -> Result<()> {
         selector: None,
         inspected_host: String::new(),
         manual: BTreeMap::new(),
-        unavailable: Vec::new(),
+        sources_unavailable: false,
     };
     ui::run(state, controller, Controller::action)
 }
@@ -1299,7 +1311,7 @@ mod controller_tests {
             selector: None,
             inspected_host: String::new(),
             manual: BTreeMap::new(),
-            unavailable: Vec::new(),
+            sources_unavailable: false,
         }
     }
 
@@ -1760,6 +1772,34 @@ mod controller_tests {
         assert!(selector.contains(&config::quote(explicit.to_str().unwrap())));
         assert!(!selector.contains("builtins.fetchGit"));
     }
+
+    #[test]
+    fn local_sources_reuse_the_checked_out_branch_and_add_head_for_other_refs() {
+        let fixture = Fixture::new();
+        let root = fixture.0.canonicalize().unwrap();
+        let module = root.join("demo");
+        fs::create_dir(&module).unwrap();
+        fs::write(module.join("default.nix"), "{}").unwrap();
+        fs::write(module.join("module.json"), "{}").unwrap();
+        git_output(
+            &root,
+            &["init", "--quiet", "--template=", "--initial-branch=current"],
+        )
+        .unwrap();
+        let source = |reference: &str| SourceSpec {
+            repository: root.to_str().unwrap().into(),
+            reference: reference.into(),
+            mode: SourceMode::Local,
+        };
+        let original = [module.to_str().unwrap().to_owned()];
+        let mut sources = vec![source("current")];
+        add_local_sources(&[], &original, &mut sources);
+        assert_eq!(sources, [source("current")]);
+        let mut sources = vec![source("other")];
+        add_local_sources(&[], &original, &mut sources);
+        assert_eq!(sources, [source("other"), source("HEAD")]);
+    }
+
     #[test]
     fn uncached_remote_leaves_local_catalog_browsable_and_blocks_writes() {
         if Command::new("nix").arg("--version").output().is_err() {

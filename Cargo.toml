@@ -1,6 +1,6 @@
 [package]
 name = "nixos-installer"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Terminal installer and module configurator for NixOS"

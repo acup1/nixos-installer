@@ -641,7 +641,7 @@ fn cached_checkout(
                 read_json::<CacheRecord>(&entry.join("source.json")).is_ok_and(|record| {
                     record.spec.repository == spec.repository
                         && record.spec.mode == spec.mode
-                        && record.revision == selector
+                        && record.revision.eq_ignore_ascii_case(selector)
                 })
             })
             .unwrap_or(expected)
@@ -689,11 +689,17 @@ fn cached_checkout(
     }
     ensure_directory(&entry)?;
     let record: CacheRecord = read_json(&entry.join("source.json"))?;
-    let matching_pin = is_commit_id(selector)
-        && record.revision == selector
+    let fixed_revision = is_commit_id(selector);
+    let matching_pin = record.revision.eq_ignore_ascii_case(selector)
         && record.spec.repository == spec.repository
         && record.spec.mode == spec.mode;
-    if (&record.spec != spec && !matching_pin) || !is_commit_id(&record.revision) {
+    if !is_commit_id(&record.revision)
+        || if fixed_revision {
+            !matching_pin
+        } else {
+            &record.spec != spec
+        }
+    {
         return Err(format!("Запись кеша повреждена: {}", entry.display()));
     }
     let checkout = entry.join("checkout");
@@ -1100,6 +1106,66 @@ mod tests {
         symlink(fixture.0.join("outside/module.json"), &manifest).unwrap();
         assert!(read_checkout(&repository).is_err());
     }
+
+    #[test]
+    fn offline_pin_checks_revision_and_origin_when_reusing_branch_cache() {
+        let fixture = Fixture::new();
+        let repository = fixture.repository("repo");
+        write_module(&repository, "demo", MANIFEST);
+        let revision = commit(&repository);
+        let cache = fixture.0.join("cache");
+        let branch = SourceSpec {
+            repository: "https://example.invalid/catalog.git".into(),
+            reference: "main".into(),
+            mode: SourceMode::Pinned,
+        };
+        let (checkout, _) = cached_checkout(
+            &branch,
+            &cache,
+            "refs/heads/main",
+            repository.to_str().unwrap(),
+            Some(&revision),
+            true,
+        )
+        .unwrap();
+        let pinned = SourceSpec {
+            reference: revision.clone(),
+            ..branch
+        };
+        assert_eq!(discover_cached(&pinned, &cache).unwrap().checkout, checkout);
+
+        let foreign = SourceSpec {
+            repository: "https://another.invalid/catalog.git".into(),
+            ..pinned.clone()
+        };
+        assert!(
+            discover_cached(&foreign, &cache)
+                .unwrap_err()
+                .contains("not cached")
+        );
+
+        let entry = cache.join(cache_id(&pinned, None));
+        fs::create_dir(&entry).unwrap();
+        let record = CacheRecord {
+            spec: pinned.clone(),
+            revision: if revision == "0".repeat(40) {
+                "1".repeat(40)
+            } else {
+                "0".repeat(40)
+            },
+        };
+        fs::write(
+            entry.join("source.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            discover_cached(&pinned, &cache)
+                .unwrap_err()
+                .contains("Запись кеша повреждена")
+        );
+    }
+
     #[test]
     fn cold_configure_does_not_fetch_a_remote_catalog() {
         let fixture = Fixture::new();
