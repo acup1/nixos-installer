@@ -607,6 +607,15 @@ impl Controller {
             }
             Action::LoadCatalog => self.refresh(state, false),
             Action::RefreshCatalog => self.refresh(state, true),
+            Action::UpdateLocalRepository(offer) => {
+                let (spec, update) = *offer;
+                if !state.repositories.contains(&spec) || !self.loaded.contains(&spec) {
+                    return Err("The repository source changed. Reload the catalog first.".into());
+                }
+                catalog::apply_local_update(&spec, &update)?;
+                let refreshed = self.refresh(state, false)?;
+                Ok(format!("Updated {}. {refreshed}", spec.repository))
+            }
             Action::RefreshDisks => {
                 state.disks = install::probe()?;
                 state.plan = None;

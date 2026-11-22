@@ -28,6 +28,29 @@ pub struct SourceSpec {
 }
 
 #[derive(Clone, Debug)]
+pub enum LocalUpdateStatus {
+    Available(LocalUpdate),
+    Blocked(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalUpdate {
+    pub commits: u64,
+    checkout: PathBuf,
+    branch: String,
+    head: String,
+    upstream: Upstream,
+    target: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Upstream {
+    tracking_ref: String,
+    remote: String,
+    remote_ref: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct CatalogSource {
     pub spec: SourceSpec,
     pub checkout: PathBuf,
@@ -504,7 +527,14 @@ where
     {
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_NO_LAZY_FETCH", "1");
+    }
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument.as_ref() == "status")
+    {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
     }
     command
         .env_remove("GIT_DIR")
@@ -706,6 +736,205 @@ fn checkout_path(path: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(canonical)
+}
+
+fn local_update_branch(spec: &SourceSpec) -> Option<(PathBuf, String)> {
+    let candidate = Path::new(&spec.repository);
+    if spec.mode != SourceMode::Local || !candidate.join(".git").exists() {
+        return None;
+    }
+
+    let checkout = checkout_path(candidate).ok()?;
+    let branch = run_git(&checkout, ["symbolic-ref", "--quiet", "HEAD"], false)
+        .ok()?
+        .trim_end()
+        .to_owned();
+    let selector = reference_selector(&spec.reference, &checkout).ok()?;
+    if !branch.starts_with("refs/heads/") || (selector != "HEAD" && selector != branch) {
+        return None;
+    }
+
+    Some((checkout, branch))
+}
+
+fn branch_upstream(checkout: &Path, branch: &str) -> Option<Upstream> {
+    let output = run_git(
+        checkout,
+        [
+            "for-each-ref",
+            "--format=%(upstream)%09%(upstream:remotename)%09%(upstream:remoteref)",
+            "--",
+            branch,
+        ],
+        false,
+    )
+    .ok()?;
+    let (tracking_ref, remote) = output.strip_suffix('\n')?.split_once('\t')?;
+    let (remote, remote_ref) = remote.split_once('\t')?;
+    let expected_prefix = if remote == "." {
+        "refs/heads/"
+    } else {
+        "refs/remotes/"
+    };
+    if !tracking_ref.starts_with(expected_prefix)
+        || remote.is_empty()
+        || !remote_ref.starts_with("refs/heads/")
+    {
+        return None;
+    }
+
+    Some(Upstream {
+        tracking_ref: tracking_ref.into(),
+        remote: remote.into(),
+        remote_ref: remote_ref.into(),
+    })
+}
+
+fn clean_local_checkout(checkout: &Path) -> Result<(), String> {
+    let git_dir = run_git(checkout, ["rev-parse", "--absolute-git-dir"], false)?;
+    let git_dir = Path::new(git_dir.strip_suffix('\n').unwrap_or(&git_dir));
+    for state in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-apply",
+        "rebase-merge",
+        "sequencer",
+    ] {
+        if git_dir
+            .join(state)
+            .try_exists()
+            .map_err(|error| error.to_string())?
+        {
+            return Err("A Git operation is in progress.".into());
+        }
+    }
+
+    let status = run_git(
+        checkout,
+        [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        false,
+    )?;
+    if !status.is_empty() {
+        return Err("The repository has local changes or untracked files.".into());
+    }
+    Ok(())
+}
+
+pub fn check_local_update(spec: &SourceSpec) -> Option<LocalUpdateStatus> {
+    let (checkout, branch) = local_update_branch(spec)?;
+    let upstream = branch_upstream(&checkout, &branch)?;
+    if upstream.remote != "." {
+        // Fetch follows symbolic destinations, even when the destination name
+        // looks like a remote-tracking ref.
+        if !crate::read_command::network_allowed()
+            || run_git(
+                &checkout,
+                ["symbolic-ref", "--quiet", &upstream.tracking_ref],
+                false,
+            )
+            .is_ok()
+        {
+            return None;
+        }
+        run_git(
+            &checkout,
+            [
+                "fetch",
+                "--quiet",
+                "--no-all",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-prune",
+                "--no-prune-tags",
+                "--no-auto-gc",
+                "--no-write-commit-graph",
+                "--no-write-fetch-head",
+                "--refmap=",
+                "--",
+                &upstream.remote,
+                &format!("+{}:{}", upstream.remote_ref, upstream.tracking_ref),
+            ],
+            true,
+        )
+        .ok()?;
+    }
+
+    let current_branch = run_git(&checkout, ["symbolic-ref", "--quiet", "HEAD"], false).ok()?;
+    if current_branch.trim_end() != branch {
+        return None;
+    }
+    let head = commit_at(&checkout, &branch).ok()?;
+    let target = commit_at(&checkout, &upstream.tracking_ref).ok()?;
+    let counts = run_git(
+        &checkout,
+        [
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{head}...{target}"),
+        ],
+        false,
+    )
+    .ok()?;
+    let (ahead, behind) = counts.trim_end().split_once('\t')?;
+    let commits = behind.parse::<u64>().ok()?;
+    if commits == 0 {
+        return None;
+    }
+    if ahead != "0" {
+        return Some(LocalUpdateStatus::Blocked(
+            "The local branch has diverged from its upstream.".into(),
+        ));
+    }
+    if let Err(reason) = clean_local_checkout(&checkout) {
+        return Some(LocalUpdateStatus::Blocked(reason));
+    }
+
+    Some(LocalUpdateStatus::Available(LocalUpdate {
+        commits,
+        checkout,
+        branch,
+        head,
+        upstream,
+        target,
+    }))
+}
+
+pub fn apply_local_update(spec: &SourceSpec, update: &LocalUpdate) -> Result<(), String> {
+    let stale = || "The branch or its upstream changed. Refresh the catalog to check again.";
+    let (checkout, branch) = local_update_branch(spec).ok_or_else(stale)?;
+    if checkout != update.checkout
+        || branch != update.branch
+        || branch_upstream(&checkout, &branch).as_ref() != Some(&update.upstream)
+        || commit_at(&checkout, "HEAD")? != update.head
+        || commit_at(&checkout, &update.upstream.tracking_ref)? != update.target
+    {
+        return Err(stale().into());
+    }
+    clean_local_checkout(&checkout)?;
+    run_git(
+        &checkout,
+        [
+            "-c",
+            "submodule.recurse=false",
+            "merge",
+            "--quiet",
+            "--ff-only",
+            "--no-squash",
+            "--no-autostash",
+            "--no-overwrite-ignore",
+            "--",
+            &update.target,
+        ],
+        false,
+    )?;
+    Ok(())
 }
 
 fn cache_id(spec: &SourceSpec, local_revision: Option<&str>) -> String {
@@ -1087,6 +1316,155 @@ mod tests {
             reference: reference.into(),
             mode: SourceMode::Local,
         }
+    }
+
+    fn tracking_checkout(fixture: &Fixture) -> (PathBuf, PathBuf, String) {
+        let upstream = fixture.repository("upstream");
+        write_module(&upstream, "original", MANIFEST);
+        let initial = commit(&upstream);
+        let checkout = fixture.0.join("checkout");
+        run_git(
+            &fixture.0,
+            [
+                "clone",
+                "--quiet",
+                "--origin",
+                "upstream",
+                upstream.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+        (upstream, checkout, initial)
+    }
+
+    fn available_update(spec: &SourceSpec) -> LocalUpdate {
+        match check_local_update(spec) {
+            Some(LocalUpdateStatus::Available(update)) => update,
+            result => panic!("expected a local update, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn fetches_only_the_tracked_branch_and_fast_forwards_on_request() {
+        let fixture = Fixture::new();
+        let (upstream, checkout, initial) = tracking_checkout(&fixture);
+        let spec = local_source(&checkout, "refs/heads/main");
+        assert!(check_local_update(&spec).is_none());
+
+        write_module(&upstream, "added", MANIFEST);
+        let target = commit(&upstream);
+        run_git(&upstream, ["tag", "unrelated-tag"], false).unwrap();
+        run_git(&upstream, ["branch", "unrelated-branch"], false).unwrap();
+        run_git(
+            &checkout,
+            ["config", "branch.main.mergeOptions", "--squash"],
+            false,
+        )
+        .unwrap();
+
+        let update = available_update(&spec);
+        assert_eq!(update.commits, 1);
+        assert_eq!(commit_at(&checkout, "HEAD").unwrap(), initial);
+        assert!(!checkout.join("added").exists());
+        assert!(commit_at(&checkout, "refs/tags/unrelated-tag").is_err());
+        assert!(commit_at(&checkout, "refs/remotes/upstream/unrelated-branch").is_err());
+
+        // Applying contacts no remote, even though it would now fail to fetch.
+        fs::rename(&upstream, fixture.0.join("unavailable")).unwrap();
+        apply_local_update(&spec, &update).unwrap();
+        assert_eq!(commit_at(&checkout, "HEAD").unwrap(), target);
+        assert!(checkout.join("added/module.json").is_file());
+    }
+
+    #[test]
+    fn blocks_dirty_and_diverged_branches_and_rechecks_offered_updates() {
+        let fixture = Fixture::new();
+        let (upstream, checkout, initial) = tracking_checkout(&fixture);
+        let spec = local_source(&checkout, "HEAD");
+        write_module(&upstream, "upstream-module", MANIFEST);
+        commit(&upstream);
+        let update = available_update(&spec);
+
+        write_module(&checkout, "local-module", MANIFEST);
+        assert!(matches!(
+            check_local_update(&spec),
+            Some(LocalUpdateStatus::Blocked(reason)) if reason.contains("local changes")
+        ));
+        assert!(apply_local_update(&spec, &update).is_err());
+        assert_eq!(commit_at(&checkout, "HEAD").unwrap(), initial);
+
+        let local = commit(&checkout);
+        assert!(matches!(
+            check_local_update(&spec),
+            Some(LocalUpdateStatus::Blocked(reason)) if reason.contains("diverged")
+        ));
+        assert!(apply_local_update(&spec, &update).is_err());
+        assert_eq!(commit_at(&checkout, "HEAD").unwrap(), local);
+    }
+
+    #[test]
+    fn rejects_an_offer_after_the_tracking_ref_changes() {
+        let fixture = Fixture::new();
+        let (upstream, checkout, initial) = tracking_checkout(&fixture);
+        let spec = local_source(&checkout, "");
+        write_module(&upstream, "first", MANIFEST);
+        commit(&upstream);
+        let stale = available_update(&spec);
+        write_module(&upstream, "second", MANIFEST);
+        let latest = commit(&upstream);
+        let current = available_update(&spec);
+
+        assert!(apply_local_update(&spec, &stale).is_err());
+        assert_eq!(commit_at(&checkout, "HEAD").unwrap(), initial);
+        apply_local_update(&spec, &current).unwrap();
+        assert_eq!(commit_at(&checkout, "HEAD").unwrap(), latest);
+        assert!(check_local_update(&spec).is_none());
+        write_module(&checkout, "local-module", MANIFEST);
+        let local = commit(&checkout);
+        assert!(check_local_update(&spec).is_none());
+        assert_eq!(commit_at(&checkout, "HEAD").unwrap(), local);
+    }
+
+    #[test]
+    fn skips_sources_that_do_not_follow_the_checked_out_branch() {
+        let fixture = Fixture::new();
+        let (upstream, checkout, initial) = tracking_checkout(&fixture);
+        write_module(&upstream, "added", MANIFEST);
+        commit(&upstream);
+        run_git(&checkout, ["tag", "original"], false).unwrap();
+        run_git(&checkout, ["branch", "other"], false).unwrap();
+
+        let mut pinned = local_source(&checkout, "HEAD");
+        pinned.mode = SourceMode::Pinned;
+        for spec in [
+            pinned,
+            local_source(&checkout, &initial),
+            local_source(&checkout, "refs/tags/original"),
+            local_source(&checkout, "other"),
+            local_source(&checkout.join("original"), "HEAD"),
+            local_source(&upstream, "HEAD"),
+        ] {
+            assert!(check_local_update(&spec).is_none(), "{spec:?}");
+        }
+        assert_eq!(
+            commit_at(&checkout, "refs/remotes/upstream/main").unwrap(),
+            initial
+        );
+
+        run_git(
+            &checkout,
+            [
+                "symbolic-ref",
+                "refs/remotes/upstream/main",
+                "refs/heads/other",
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(check_local_update(&local_source(&checkout, "HEAD")).is_none());
+        assert_eq!(commit_at(&checkout, "refs/heads/other").unwrap(), initial);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::catalog::{
-    CatalogModule, Layer, ManifestOption, OptionKind, Platform, SourceMode, SourceSpec, Target,
+    CatalogModule, Layer, LocalUpdate, LocalUpdateStatus, ManifestOption, OptionKind, Platform,
+    SourceMode, SourceSpec, Target, check_local_update,
 };
 use crate::config::{Identity, validate_hostname, validate_username};
 use crate::install::{
@@ -7,7 +8,12 @@ use crate::install::{
 };
 use crate::read_command::Cancellation;
 use serde_json::Value;
-use std::{collections::BTreeMap, env, fs, io, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env, fs, io,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 use terminalib::{
     CellStyle, FrameBuffer, KEY_DOWN, KEY_FAIL, KEY_LEFT, KEY_PASTE, KEY_RIGHT, KEY_UP,
     MOUSE_EVENT, Mouse, MouseEvent, Rgb,
@@ -112,6 +118,7 @@ impl Session {
 pub enum Action {
     LoadCatalog,
     RefreshCatalog,
+    UpdateLocalRepository(Box<(SourceSpec, LocalUpdate)>),
     RefreshDisks,
     EditPartitions(String),
     Calamares,
@@ -335,6 +342,7 @@ struct Ui {
     catalog_dirty: bool,
     calamares: bool,
     loading: bool,
+    local_updates: HashMap<SourceSpec, LocalUpdateStatus>,
     nav_hits: Vec<(Area, usize)>,
     exit_hit: Option<Area>,
     accept_hit: Option<Area>,
@@ -362,6 +370,7 @@ type ActionHandler<T> = fn(&mut T, Action, &mut Session) -> Result<String, Strin
 struct CatalogJob<T> {
     receiver: std::sync::mpsc::Receiver<(T, Session, Result<String, String>)>,
     stop: Cancellation,
+    updating_repository: bool,
 }
 
 impl<T: Send + 'static> CatalogJob<T> {
@@ -374,6 +383,7 @@ impl<T: Send + 'static> CatalogJob<T> {
         let (sender, receiver) = std::sync::mpsc::channel();
         let stop = Cancellation::default();
         let cancellation = stop.clone();
+        let updating_repository = matches!(action, Action::UpdateLocalRepository(..));
         std::thread::spawn(move || {
             let allow_network =
                 session.mode == Mode::Install || matches!(action, Action::RefreshCatalog);
@@ -382,11 +392,56 @@ impl<T: Send + 'static> CatalogJob<T> {
             });
             let _ = sender.send((controller, session, result));
         });
-        Self { receiver, stop }
+        Self {
+            receiver,
+            stop,
+            updating_repository,
+        }
     }
 }
 
 impl<T> Drop for CatalogJob<T> {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+struct LocalUpdateCheck {
+    receiver: std::sync::mpsc::Receiver<(SourceSpec, LocalUpdateStatus)>,
+    stop: Cancellation,
+}
+
+impl LocalUpdateCheck {
+    fn start(repositories: &[SourceSpec]) -> Option<Self> {
+        let local: Vec<_> = repositories
+            .iter()
+            .filter(|spec| {
+                spec.mode == SourceMode::Local && Path::new(&spec.repository).join(".git").exists()
+            })
+            .cloned()
+            .collect();
+        if local.is_empty() {
+            return None;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let stop = Cancellation::default();
+        let cancellation = stop.clone();
+        std::thread::spawn(move || {
+            cancellation.scope(true, || {
+                for spec in local {
+                    if let Some(status) = check_local_update(&spec)
+                        && sender.send((spec, status)).is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        });
+        Some(Self { receiver, stop })
+    }
+}
+
+impl Drop for LocalUpdateCheck {
     fn drop(&mut self) {
         self.stop.cancel();
     }
@@ -409,11 +464,13 @@ pub fn run<T: Send + 'static>(
     };
     let mut controller = Some(controller);
     let mut job = None::<CatalogJob<T>>;
+    let mut update_check = None::<LocalUpdateCheck>;
     let mut redraw = true;
     loop {
         if let Some(active) = &job {
             match active.receiver.try_recv() {
                 Ok((returned, updated, result)) => {
+                    let updating_repository = active.updating_repository;
                     controller = Some(returned);
                     job = None;
                     ui.loading = false;
@@ -421,6 +478,7 @@ pub fn run<T: Send + 'static>(
                         Ok(message) => {
                             state = updated;
                             ui.catalog_dirty = state.catalog_warning.is_some();
+                            update_check = LocalUpdateCheck::start(&state.repositories);
                             if let Some(warning) = &state.catalog_warning {
                                 ui.failure("Catalog incomplete", warning.clone());
                             } else {
@@ -429,7 +487,12 @@ pub fn run<T: Send + 'static>(
                         }
                         Err(message) => {
                             ui.catalog_dirty = true;
-                            ui.failure("Catalog unavailable", message);
+                            let title = if updating_repository {
+                                "Repository update failed"
+                            } else {
+                                "Catalog unavailable"
+                            };
+                            ui.failure(title, message);
                         }
                     }
                     redraw = true;
@@ -438,6 +501,12 @@ pub fn run<T: Send + 'static>(
                 Err(TryRecvError::Disconnected) => {
                     return Err("The catalog worker stopped unexpectedly.".into());
                 }
+            }
+        }
+        if let Some(check) = &update_check {
+            for (spec, status) in check.receiver.try_iter() {
+                ui.local_updates.insert(spec, status);
+                redraw = true;
             }
         }
         let (height, width) = terminal.getsize();
@@ -465,12 +534,16 @@ pub fn run<T: Send + 'static>(
         match ui.event(&mut state, event) {
             Outcome::Continue => {}
             Outcome::Quit => return terminal.restore().map_err(error),
-            Outcome::Execute(Action::RefreshCatalog) => {
+            Outcome::Execute(
+                action @ (Action::RefreshCatalog | Action::UpdateLocalRepository(..)),
+            ) => {
                 ui.loading = true;
+                update_check = None;
+                ui.local_updates.clear();
                 job = Some(CatalogJob::start(
                     controller.take().expect("idle controller"),
                     state.clone(),
-                    Action::RefreshCatalog,
+                    action,
                     handle,
                 ));
             }
@@ -753,6 +826,29 @@ impl Ui {
         }
         if self.page + 1 < pages(state.mode).len() {
             rows.push(Row::action("Continue →", Control::Page(self.page + 1)));
+        }
+        if self.screen(state) == Page::Sources {
+            for (index, spec) in state.repositories.iter().enumerate() {
+                match self.local_updates.get(spec) {
+                    Some(LocalUpdateStatus::Available(update)) => rows.push(Row::action(
+                        format!(
+                            "Update repository {} · {} incoming · {}",
+                            index + 1,
+                            update.commits,
+                            spec.repository
+                        ),
+                        Control::Send(Action::UpdateLocalRepository(Box::new((
+                            spec.clone(),
+                            update.clone(),
+                        )))),
+                    )),
+                    Some(LocalUpdateStatus::Blocked(reason)) => rows.push(Row::note(format!(
+                        "Repository {} update blocked · {reason}",
+                        index + 1
+                    ))),
+                    None => {}
+                }
+            }
         }
         rows
     }
@@ -1128,6 +1224,26 @@ impl Ui {
             }
             Event::Key(16) if self.page > 0 => {
                 self.change_page(self.page - 1);
+                Outcome::Continue
+            }
+            Event::Key(21) => {
+                if state
+                    .repositories
+                    .iter()
+                    .any(|spec| self.local_updates.contains_key(spec))
+                {
+                    self.change_page(0);
+                    let sources = self.rows(state);
+                    self.focus = sources
+                        .iter()
+                        .position(|row| {
+                            matches!(
+                                &row.control,
+                                Some(Control::Send(Action::UpdateLocalRepository(..)))
+                            )
+                        })
+                        .unwrap_or_else(|| sources.len().saturating_sub(1));
+                }
                 Outcome::Continue
             }
             Event::Key(KEY_UP | KEY_LEFT | BACK_TAB) => {
@@ -2073,6 +2189,13 @@ impl Ui {
         self.exit_hit = Some(button(frame, nav_y, width / 2 - 5, " Esc  Exit "));
         let bottom = if self.loading {
             ("Loading module sources…   Esc Exit".into(), BLUE)
+        } else if self.message.as_ref().is_none_or(|(_, success)| *success)
+            && state
+                .repositories
+                .iter()
+                .any(|spec| self.local_updates.contains_key(spec))
+        {
+            ("Local repository updates · Ctrl+U".into(), BLUE)
         } else if let Some((message, success)) = &self.message {
             (
                 format!(
