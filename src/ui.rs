@@ -1,6 +1,7 @@
 use crate::catalog::{
     CatalogModule, Layer, ManifestOption, OptionKind, Platform, SourceMode, SourceSpec, Target,
 };
+use crate::config::{Identity, validate_hostname, validate_username};
 use crate::install::{
     BlockDevice, BootMode, DiskLayout, FileSystem, InstallPlan, InstallRequest, confirmation_token,
 };
@@ -35,6 +36,10 @@ pub struct Session {
     pub flake: String,
     pub detected_flake: String,
     pub selector: String,
+    pub identity: Identity,
+    pub saved_identity: Identity,
+    pub inherited_identity: Identity,
+    pub suggested_identity: Identity,
     pub install: InstallRequest,
     pub disks: Vec<BlockDevice>,
     pub plan: Option<InstallPlan>,
@@ -56,10 +61,37 @@ impl Session {
             flake,
             detected_flake: String::new(),
             selector,
+            identity: Identity::default(),
+            saved_identity: Identity::default(),
+            inherited_identity: Identity::default(),
+            suggested_identity: Identity::default(),
             install,
             disks: Vec::new(),
             plan: None,
             catalog_warning: None,
+        }
+    }
+
+    fn identity_value(&self, field: Field) -> (Option<&str>, &'static str) {
+        let (edited, inherited, fallback) = match field {
+            Field::Username => (
+                &self.identity.username,
+                &self.inherited_identity.username,
+                &self.suggested_identity.username,
+            ),
+            Field::Hostname => (
+                &self.identity.hostname,
+                &self.inherited_identity.hostname,
+                &self.suggested_identity.hostname,
+            ),
+            _ => unreachable!("system identity field"),
+        };
+        if let Some(value) = edited {
+            (Some(value), "override")
+        } else if let Some(value) = inherited {
+            (Some(value), "inherited")
+        } else {
+            (fallback.as_deref(), "selector unset")
         }
     }
 
@@ -143,7 +175,7 @@ const INSTALL_PAGES: &[Page] = &[
     Page::Storage,
     Page::Review,
 ];
-const CONFIG_PAGES: &[Page] = &[Page::Sources, Page::Modules, Page::Review];
+const CONFIG_PAGES: &[Page] = &[Page::Sources, Page::Modules, Page::System, Page::Review];
 
 #[derive(Clone, Copy)]
 enum Field {
@@ -699,6 +731,19 @@ impl Ui {
                 }
                 rows
             }
+            Page::System if state.mode == Mode::Configure => {
+                [("Hostname", Field::Hostname), ("Username", Field::Username)]
+                    .into_iter()
+                    .map(|(label, field)| {
+                        let (value, origin) = state.identity_value(field);
+                        Row::field(
+                            label,
+                            &format!("{} ({origin})", value.unwrap_or("—")),
+                            field,
+                        )
+                    })
+                    .collect()
+            }
             Page::System => self.system_rows(&state.install),
             Page::Storage => self.storage_rows(state),
             Page::Review => self.review_rows(state),
@@ -878,6 +923,27 @@ impl Ui {
             state.repositories.len(),
             target.system,
         )));
+        if state.mode == Mode::Configure {
+            for (label, field, changed) in [
+                (
+                    "Hostname",
+                    Field::Hostname,
+                    state.identity.hostname != state.saved_identity.hostname,
+                ),
+                (
+                    "Username",
+                    Field::Username,
+                    state.identity.username != state.saved_identity.username,
+                ),
+            ] {
+                let (value, status) = state.identity_value(field);
+                let change = if changed { " · change pending" } else { "" };
+                rows.push(Row::note(format!(
+                    "{label} · {} ({status}){change}",
+                    value.unwrap_or("—")
+                )));
+            }
+        }
         for module in active {
             let manifest = &module.module.manifest;
             let active_overrides = manifest
@@ -897,9 +963,32 @@ impl Ui {
                 )),
                 manifest.available_on(&target),
             ));
+            let mut packages = package_groups(manifest);
             for option in &manifest.options {
+                if is_package_switch(option) {
+                    let Some(members) = packages.remove(option.path.as_slice()) else {
+                        continue;
+                    };
+                    if !members.iter().any(|&index| {
+                        module
+                            .values
+                            .contains_key(&option_key(&manifest.options[index]))
+                    }) {
+                        continue;
+                    }
+                    let available = available_members(manifest, &members, &target);
+                    let active = !available.is_empty();
+                    let targets = if active { &available } else { &members };
+                    let title = &manifest.options[targets[0]].title;
+                    rows.push(mark_parameter_availability(
+                        Row::note(format!("    {} {title}", switch_mark(module, targets))),
+                        active,
+                        &target,
+                    ));
+                    continue;
+                }
                 if let Some(value) = module.values.get(&option_key(option)) {
-                    rows.push(mark_available(
+                    rows.push(mark_parameter_availability(
                         Row::note(format!(
                             "    {} · {} = {}",
                             layer_name(option.layer),
@@ -907,6 +996,7 @@ impl Ui {
                             option_text(option.kind, value)
                         )),
                         manifest.option_available_on(option, &target),
+                        &target,
                     ));
                 }
             }
@@ -1062,6 +1152,12 @@ impl Ui {
                     }
                     Some(Control::ChooseParameter(row, parameter)) => {
                         reset_parameter(state, *row, *parameter);
+                    }
+                    Some(Control::Edit(Field::Username)) if state.mode == Mode::Configure => {
+                        state.identity.username = None;
+                    }
+                    Some(Control::Edit(Field::Hostname)) if state.mode == Mode::Configure => {
+                        state.identity.hostname = None;
                     }
                     _ => {}
                 }
@@ -1350,6 +1446,16 @@ impl Ui {
                         editor.cursor = 0;
                     }
                     Event::Key(18) => {
+                        if state.mode == Mode::Configure
+                            && let EditTarget::Field(field @ (Field::Username | Field::Hostname)) =
+                                editor.target
+                        {
+                            if let Err(error) = self.set_field(state, field, "") {
+                                editor.error = Some(error);
+                            } else {
+                                return Outcome::Continue;
+                            }
+                        }
                         if let EditTarget::Field(Field::Parameter(row, parameter)) = editor.target {
                             reset_parameter(state, row, parameter);
                             return Outcome::Continue;
@@ -1492,6 +1598,9 @@ impl Ui {
             }
             Field::Flake => state.flake.clone(),
             Field::Selector => state.selector.clone(),
+            Field::Hostname | Field::Username if state.mode == Mode::Configure => {
+                state.identity_value(field).0.unwrap_or_default().into()
+            }
             Field::Hostname => state.install.hostname.clone(),
             Field::Username => state.install.username.clone(),
             Field::Timezone => state.install.timezone.clone(),
@@ -1512,12 +1621,7 @@ impl Ui {
         if value.is_empty()
             && matches!(
                 field,
-                Field::Source(_)
-                    | Field::Hostname
-                    | Field::Username
-                    | Field::Timezone
-                    | Field::Locale
-                    | Field::Keymap
+                Field::Source(_) | Field::Timezone | Field::Locale | Field::Keymap
             )
         {
             return Err("This field is required.".into());
@@ -1565,10 +1669,39 @@ impl Ui {
                     state.selector = value.into();
                     state.flake.clear();
                     state.detected_flake.clear();
+                    state.identity = Identity::default();
+                    state.saved_identity = Identity::default();
+                    state.inherited_identity = Identity::default();
+                    state.suggested_identity = Identity::default();
+                    self.catalog_dirty = true;
                 }
             }
-            Field::Hostname => state.install.hostname = value.into(),
-            Field::Username => state.install.username = value.into(),
+            Field::Hostname => {
+                if state.mode == Mode::Configure {
+                    if !value.is_empty() {
+                        validate_hostname(value)?;
+                    }
+                    state.identity.hostname = (!value.is_empty()
+                        && state.inherited_identity.hostname.as_deref() != Some(value))
+                    .then(|| value.into());
+                } else {
+                    validate_hostname(value)?;
+                    state.install.hostname = value.into();
+                }
+            }
+            Field::Username => {
+                if state.mode == Mode::Configure {
+                    if !value.is_empty() {
+                        validate_username(value, state.target().platform == Platform::Darwin)?;
+                    }
+                    state.identity.username = (!value.is_empty()
+                        && state.inherited_identity.username.as_deref() != Some(value))
+                    .then(|| value.into());
+                } else {
+                    validate_username(value, false)?;
+                    state.install.username = value.into();
+                }
+            }
             Field::Timezone => state.install.timezone = value.into(),
             Field::Locale => state.install.locale = value.into(),
             Field::Keymap => state.install.keymap = value.into(),
@@ -1864,6 +1997,8 @@ impl Ui {
         }
         let subtitle = if page == Page::Modules {
             format!("{} · {}", state.target().system, page.subtitle())
+        } else if page == Page::System && state.mode == Mode::Configure {
+            "Edit selector names. Ctrl+R restores the inherited value.".into()
         } else {
             page.subtitle().into()
         };
@@ -2275,23 +2410,74 @@ fn mark_available(mut row: Row, available: bool) -> Row {
     row
 }
 
+fn mark_parameter_availability(mut row: Row, available: bool, target: &Target) -> Row {
+    if !available {
+        row.text
+            .push_str(&format!(" — unavailable on {}", target.system));
+        row.color = MUTED;
+    }
+    row
+}
+
+fn package_groups(manifest: &crate::catalog::Manifest) -> BTreeMap<&[String], Vec<usize>> {
+    let mut packages = BTreeMap::<&[String], Vec<usize>>::new();
+    for (index, option) in manifest
+        .options
+        .iter()
+        .enumerate()
+        .filter(|(_, option)| is_package_switch(option))
+    {
+        packages.entry(&option.path).or_default().push(index);
+    }
+    packages
+}
+
+fn available_members(
+    manifest: &crate::catalog::Manifest,
+    members: &[usize],
+    target: &Target,
+) -> Vec<usize> {
+    members
+        .iter()
+        .copied()
+        .filter(|&index| manifest.option_available_on(&manifest.options[index], target))
+        .collect()
+}
+
+fn switch_mark(row: &ModuleRow, targets: &[usize]) -> &'static str {
+    if targets.iter().all(|&i| row.boolean(i) == Some(true)) {
+        "[×]"
+    } else if targets.iter().all(|&i| row.boolean(i) == Some(false)) {
+        "[ ]"
+    } else {
+        "[–]"
+    }
+}
+
 fn parameter_rows(index: usize, row: &ModuleRow, target: &Target) -> Vec<Row> {
     let manifest = &row.module.manifest;
-    let available = |option: &ManifestOption| manifest.option_available_on(option, target);
-    // Group matching package paths without making an active switch change
-    // the saved value for an unavailable layer of the same package.
-    let mut packages = BTreeMap::<(&[String], bool), Vec<usize>>::new();
-    for (i, option) in manifest.options.iter().enumerate() {
-        if is_package_switch(option) {
-            packages
-                .entry((&option.path, available(option)))
-                .or_default()
-                .push(i);
-        }
-    }
+    let mut packages = package_groups(manifest);
     let mut rows = Vec::new();
     for (i, option) in manifest.options.iter().enumerate() {
-        let active = available(option);
+        if is_package_switch(option) {
+            let Some(members) = packages.remove(option.path.as_slice()) else {
+                continue;
+            };
+            let available = available_members(manifest, &members, target);
+            let active = !available.is_empty();
+            let targets = if active { available } else { members };
+            let title = &manifest.options[targets[0]].title;
+            rows.push(mark_parameter_availability(
+                Row::action(
+                    format!("  {} {title}", switch_mark(row, &targets)),
+                    Control::ToggleParameter(index, targets),
+                ),
+                active,
+                target,
+            ));
+            continue;
+        }
+        let active = manifest.option_available_on(option, target);
         let saved = row.values.get(&option_key(option));
         let label = format!("{} · {}", layer_name(option.layer), option.title);
         let setting = if option.kind == OptionKind::Packages {
@@ -2306,34 +2492,9 @@ fn parameter_rows(index: usize, row: &ModuleRow, target: &Target) -> Vec<Row> {
                 Control::ResetParameter(index, i),
             )
         } else if option.kind == OptionKind::Bool {
-            let (targets, label) = if is_package_switch(option) {
-                let Some(targets) = packages.remove(&(option.path.as_slice(), active)) else {
-                    continue;
-                };
-                let label = if active {
-                    option.title.clone()
-                } else {
-                    let layers = targets
-                        .iter()
-                        .map(|&i| layer_name(manifest.options[i].layer))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("{} · {layers}", option.title)
-                };
-                (targets, label)
-            } else {
-                (vec![i], label)
-            };
-            let mark = if targets.iter().all(|&i| row.boolean(i) == Some(true)) {
-                "[×]"
-            } else if targets.iter().all(|&i| row.boolean(i) == Some(false)) {
-                "[ ]"
-            } else {
-                "[–]"
-            };
             Row::action(
-                format!("  {mark} {label}"),
-                Control::ToggleParameter(index, targets),
+                format!("  {} {label}", switch_mark(row, &[i])),
+                Control::ToggleParameter(index, vec![i]),
             )
         } else if option.choices.is_some() {
             let display = match saved {
@@ -2358,7 +2519,7 @@ fn parameter_rows(index: usize, row: &ModuleRow, target: &Target) -> Vec<Row> {
             };
             Row::field(&format!("  {label}"), &display, Field::Parameter(index, i))
         };
-        rows.push(mark_available(setting, active));
+        rows.push(mark_parameter_availability(setting, active, target));
     }
     rows
 }
@@ -2533,7 +2694,7 @@ mod tests {
         let mut state = session();
         state.detected_flake = std::mem::take(&mut state.flake);
         let mut ui = Ui {
-            page: 2,
+            page: CONFIG_PAGES.len() - 1,
             focus: 1,
             ..Ui::default()
         };
@@ -2579,8 +2740,51 @@ mod tests {
         assert_eq!(ui.screen(&state), Page::Modules);
         frame.resize(56, 18);
         ui.render(&mut frame, &state);
-        assert!(frame_text(&frame, 5).contains("Step 2 of 3"));
+        assert!(frame_text(&frame, 5).contains("Step 2 of 4"));
         assert!(frame_text(&frame, 8).contains("Filter modules"));
+    }
+
+    #[test]
+    fn configure_system_identity_edits_and_resets_inherited_values() {
+        let mut state = session();
+        state.inherited_identity = Identity {
+            username: Some("original".into()),
+            hostname: None,
+        };
+        state.suggested_identity.hostname = Some("local-node".into());
+        let mut ui = Ui {
+            page: 2,
+            ..Ui::default()
+        };
+        assert!(
+            ui.rows(&state)[0]
+                .text
+                .contains("local-node (selector unset)")
+        );
+        assert!(ui.rows(&state)[1].text.contains("original (inherited)"));
+        assert!(
+            ui.set_field(&mut state, Field::Username, "unsafe name")
+                .is_err()
+        );
+        assert!(
+            ui.set_field(&mut state, Field::Hostname, "bad.name")
+                .is_err()
+        );
+        ui.set_field(&mut state, Field::Username, "new-user")
+            .unwrap();
+        ui.set_field(&mut state, Field::Hostname, "new-node")
+            .unwrap();
+        assert!(
+            ui.review_rows(&state)
+                .iter()
+                .any(|row| row.text.contains("new-node (override) · change pending"))
+        );
+        ui.event(&mut state, Event::Key(18));
+        assert!(state.identity.hostname.is_none());
+        ui.activate(&mut state, Some(Control::Edit(Field::Username)));
+        ui.event(&mut state, Event::Key(18));
+        assert!(state.identity.is_empty());
+        assert_eq!(ui.field(&state, Field::Username), "original");
     }
 
     #[test]
@@ -2863,10 +3067,10 @@ mod tests {
                     "schemaVersion": 1, "title": "Toolbox", "description": "Applications",
                     "layers": {"home": ["linux", "darwin"], layer: [foreign]},
                     "options": [
-                        {"layer":"home","path":["components","tool","enabledPackages","daemon"],
-                            "type":"bool","title":"Daemon","description":"Available tool","default":true},
-                        {"layer":layer,"path":["components","tool","enabledPackages","daemon"],
-                            "type":"bool","title":"Daemon","description":"Foreign layer","default":true},
+                        {"layer":"home","path":["components","tool","enabledPackages","curl"],
+                            "type":"bool","title":"curl","description":"Available tool","default":true},
+                        {"layer":layer,"path":["components","tool","enabledPackages","curl"],
+                            "type":"bool","title":"curl","description":"Foreign layer","default":true},
                         {"layer":"home","path":["components","tool","enabledPackages","intel-tool"],
                             "type":"bool","title":"Intel tool","description":"System-specific tool",
                             "systems":[format!("other-{foreign}")],"default":true}
@@ -2899,35 +3103,29 @@ mod tests {
             ..Ui::default()
         };
         let rows = ui.rows(&state);
-        assert!(
-            rows.iter()
-                .any(|row| row.text.starts_with("Unavailable") && row.text.contains("Intel tool"))
-        );
+        assert!(rows.iter().any(|row| row.text.contains(&format!(
+            "[×] Intel tool — unavailable on {}",
+            target.system
+        ))));
         assert!(!rows.iter().any(|row| row.text.contains("Foreign app")));
+        assert_eq!(
+            rows.iter().filter(|row| row.text.contains("curl")).count(),
+            1
+        );
         let active = rows
             .iter()
-            .find(|row| row.text.contains("[×] Daemon") && !row.text.starts_with("Unavailable"))
+            .find(|row| row.text.contains("[×] curl") && !row.text.contains("unavailable"))
             .unwrap();
-        let foreign_switch = rows
-            .iter()
-            .find(|row| {
-                row.text.contains(&format!("Daemon · {layer}"))
-                    && row.text.starts_with("Unavailable")
-            })
-            .unwrap();
+        let foreign_key = format!("{layer}.components.tool.enabledPackages.curl");
+        state.modules[0]
+            .values
+            .insert(foreign_key.clone(), json!(true));
         ui.activate(&mut state, active.control.clone());
         assert_eq!(
-            state.modules[0].values,
-            BTreeMap::from([(
-                "home.components.tool.enabledPackages.daemon".into(),
-                json!(false)
-            )])
-        );
-        ui.activate(&mut state, foreign_switch.control.clone());
-        assert_eq!(
-            state.modules[0].values[&format!("{layer}.components.tool.enabledPackages.daemon")],
+            state.modules[0].values["home.components.tool.enabledPackages.curl"],
             false
         );
+        assert_eq!(state.modules[0].values[&foreign_key], true);
         ui.search.clear();
         let rows = ui.rows(&state);
         let unavailable = rows
@@ -2937,6 +3135,18 @@ mod tests {
         ui.activate(&mut state, unavailable.control.clone());
         assert!(state.modules[1].selected);
         let review = ui.review_rows(&state);
+        assert_eq!(
+            review
+                .iter()
+                .filter(|row| row.text.contains("curl"))
+                .count(),
+            1
+        );
+        assert!(
+            review
+                .iter()
+                .any(|row| row.text.contains("[ ] curl") && !row.text.contains("unavailable"))
+        );
         assert!(
             review
                 .iter()

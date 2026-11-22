@@ -10,7 +10,7 @@
     inherit (cfg) system username flakeDir;
     specialArgs = { inherit self inputs system username flakeDir; };
   in {
-    nixosConfigurations.@HOST@ = nixpkgs.lib.nixosSystem {
+    nixosConfigurations.${cfg.hostName or @HOST@} = nixpkgs.lib.nixosSystem {
       inherit system specialArgs;
       modules = [
         ./configuration.nix

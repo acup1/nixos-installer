@@ -5,7 +5,7 @@ mod read_command;
 mod ui;
 
 use catalog::{CatalogSource, Layer, OptionKind, SourceMode, SourceSpec};
-use config::{Choice, Location, Selected, Selector};
+use config::{Choice, Identity, Location, Selected, Selector};
 use install::{BootMode, DiskLayout, FileSystem, InstallRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +44,28 @@ fn detected_flake(selector: Option<&Selector>, saved: &Saved, path: &str) -> Res
                 String::new()
             }
         }))
+}
+
+fn system_identity(inherited: Identity) -> Identity {
+    fn output(command: &mut Command) -> Option<String> {
+        let result = read_command::output(command).ok()?;
+        if !result.status.success() {
+            return None;
+        }
+        String::from_utf8(result.stdout)
+            .ok()
+            .map(|text| text.trim().to_owned())
+    }
+    Identity {
+        username: inherited.username.or_else(|| {
+            output(Command::new("id").arg("-un"))
+                .filter(|name| config::validate_username(name, cfg!(target_os = "macos")).is_ok())
+        }),
+        hostname: inherited.hostname.or_else(|| {
+            output(Command::new("hostname").arg("-s"))
+                .filter(|name| config::validate_hostname(name).is_ok())
+        }),
+    }
 }
 
 fn layer_name(layer: Layer) -> &'static str {
@@ -103,11 +125,12 @@ impl Controller {
         } else {
             String::new()
         };
-        let same_selector = self.inspected_host == config::flake_reference(state.host_flake())
-            && self
-                .selector
-                .as_ref()
-                .is_some_and(|selector| selector.current(selector_path));
+        let same_file = self
+            .selector
+            .as_ref()
+            .is_some_and(|selector| selector.current(selector_path));
+        let same_selector =
+            same_file && self.inspected_host == config::flake_reference(state.host_flake());
         let previous: HashMap<_, _> = if same_selector || state.mode == Mode::Install {
             state
                 .modules
@@ -142,6 +165,15 @@ impl Controller {
             .map(|selector| selector.catalog_context(state.host_flake(), offline))
             .transpose()?
             .unwrap_or_default();
+        if let Some(selector) = &selector {
+            let identity = selector.identity();
+            if !same_file {
+                state.identity = identity.clone();
+            }
+            state.saved_identity = identity;
+            state.inherited_identity = context.identity.clone();
+            state.suggested_identity = system_identity(context.identity.clone());
+        }
         add_local_sources(&context.sources, &context.originals, &mut repositories);
         let persisted = selector
             .as_ref()
@@ -448,6 +480,7 @@ impl Controller {
 
         let saved = self.synchronized_state(state, false);
         if selector.managed()
+            || !state.identity.is_empty()
             || !new.is_empty()
             || !masked.is_empty()
             || saved
@@ -461,6 +494,7 @@ impl Controller {
                     modules,
                     saved.selections.clone(),
                     saved.repositories.clone(),
+                    state.identity.clone(),
                 )?;
             } else {
                 selector.save(
@@ -469,10 +503,12 @@ impl Controller {
                     masked,
                     saved.selections.clone(),
                     saved.repositories.clone(),
+                    state.identity.clone(),
                 )?;
             }
             self.selector = Selector::read(path)?;
         }
+        state.saved_identity = state.identity.clone();
         state.repositories = saved.repositories.clone();
         self.loaded = saved.repositories.clone();
         self.saved = saved;
@@ -614,8 +650,18 @@ impl Controller {
             Action::ApplyInstall => self.apply(state),
             Action::Save => self.save(state),
             Action::Rebuild => {
-                let target =
-                    config::RebuildTarget::resolve(state.host_flake(), Path::new(&state.selector))?;
+                let selector = self
+                    .selector
+                    .as_ref()
+                    .ok_or("Load an existing selector before rebuilding.")?;
+                if !selector.current(Path::new(&state.selector)) {
+                    return Err(
+                        "The selector changed. Refresh the catalog before rebuilding.".into(),
+                    );
+                }
+                let target = selector.preview_identity(&self.dir, &state.identity, |path| {
+                    config::RebuildTarget::resolve(state.host_flake(), path)
+                })?;
                 self.save(state)?;
                 target.rebuild(Path::new(&state.selector))?;
                 Ok("System rebuilt".into())
@@ -1506,8 +1552,15 @@ mod controller_tests {
         editor.refresh(&mut state, false).unwrap();
         assert_eq!(state.host_flake(), fixture.0.to_str().unwrap());
         state.flake = format!("{}#another", state.host_flake());
+        state.identity.hostname = Some("pending-node".into());
+        editor.refresh(&mut state, true).unwrap();
+        assert_eq!(state.identity.hostname.as_deref(), Some("pending-node"));
         editor.save(&mut state).unwrap();
         assert_eq!(editor.saved.flake_override, state.flake);
+        assert_eq!(
+            Selector::read(&path).unwrap().unwrap().identity(),
+            state.identity
+        );
     }
 
     #[test]
@@ -1737,7 +1790,14 @@ mod controller_tests {
         // A v2 selector which never recorded this private catalog as a repository.
         let mask = BTreeSet::from([primary.to_str().unwrap().into()]);
         manual
-            .save("[]".into(), "[]".into(), mask.clone(), vec![], vec![])
+            .save(
+                "[]".into(),
+                "[]".into(),
+                mask.clone(),
+                vec![],
+                vec![],
+                Identity::default(),
+            )
             .unwrap();
         let start = || {
             Session::new(

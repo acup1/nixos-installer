@@ -179,6 +179,78 @@ enum Base {
     },
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Identity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+}
+
+impl Identity {
+    pub fn is_empty(&self) -> bool {
+        self.username.is_none() && self.hostname.is_none()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(username) = &self.username {
+            validate_username(username, HostPlatform::current() == HostPlatform::Darwin)?;
+        }
+        if let Some(hostname) = &self.hostname {
+            validate_hostname(hostname)?;
+        }
+        Ok(())
+    }
+
+    fn definitions(&self) -> String {
+        let mut definitions = String::new();
+        if let Some(username) = &self.username {
+            definitions.push_str(&format!(" username = {};", quote(username)));
+        }
+        if let Some(hostname) = &self.hostname {
+            definitions.push_str(&format!(" hostName = {};", quote(hostname)));
+        }
+        definitions
+    }
+}
+
+pub fn validate_hostname(hostname: &str) -> Result<()> {
+    let name = hostname.as_bytes();
+    if name.len() <= 63
+        && name.first().is_some_and(u8::is_ascii_alphanumeric)
+        && name.last().is_some_and(u8::is_ascii_alphanumeric)
+        && name.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+    {
+        Ok(())
+    } else {
+        Err("Hostname must be a DNS label of 1–63 ASCII letters, digits or hyphens.".into())
+    }
+}
+
+pub fn validate_username(username: &str, darwin: bool) -> Result<()> {
+    let letter = |c: u8| c.is_ascii_lowercase() || (darwin && c.is_ascii_uppercase());
+    let name = username.as_bytes();
+    if name.len() <= 32
+        && name.first().is_some_and(|&c| letter(c) || c == b'_')
+        && name.iter().all(|&c| {
+            letter(c) || c.is_ascii_digit() || matches!(c, b'_' | b'-') || (darwin && c == b'.')
+        })
+        && !matches!(
+            username.to_ascii_lowercase().as_str(),
+            "root" | "nobody" | "nixbld"
+        )
+    {
+        Ok(())
+    } else {
+        Err(if darwin {
+            "Use a normal short account name with ASCII letters, digits, underscores, periods or hyphens."
+        } else {
+            "Choose a normal account name with lowercase ASCII letters, digits, underscores or hyphens."
+        }.into())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {
     base: Base,
@@ -187,6 +259,8 @@ struct Record {
     masked: BTreeSet<String>,
     selected: Vec<Selected>,
     repositories: Vec<SourceSpec>,
+    #[serde(default, skip_serializing_if = "Identity::is_empty")]
+    identity: Identity,
 }
 
 const MARKER: &str = "# Managed by nixos-installer v2\n";
@@ -298,7 +372,17 @@ fn backup_path(path: &Path) -> PathBuf {
 }
 
 fn render(path: &Path, record: &Record) -> Result<String> {
+    render_with_original(path, record, None)
+}
+
+fn render_with_original(path: &Path, record: &Record, original: Option<&Path>) -> Result<String> {
     let base = match &record.base {
+        Base::Original if original.is_some() => {
+            let original = original
+                .and_then(Path::to_str)
+                .ok_or("Selector path must be UTF-8")?;
+            format!("(import (builtins.toPath {})) args", quote(original))
+        }
         Base::Original => {
             let backup = backup_path(path);
             let name = backup
@@ -318,6 +402,29 @@ fn render(path: &Path, record: &Record) -> Result<String> {
             quote(system),
         ),
     };
+    let system_change = if matches!(record.base, Base::Fresh { .. }) {
+        let mut options = String::new();
+        if let Some(hostname) = &record.identity.hostname {
+            options.push_str(&format!(
+                " networking.hostName = lib.mkOverride 90 {};",
+                quote(hostname)
+            ));
+        }
+        if let Some(username) = &record.identity.username {
+            options.push_str(&format!(
+                " users.users.{}.isNormalUser = lib.mkDefault true;",
+                quote(username)
+            ));
+        }
+        if options.is_empty() {
+            String::new()
+        } else {
+            format!(" ++ [ {{ nixos = {{ lib, ... }}: {{{options} }}; }} ]")
+        }
+    } else {
+        String::new()
+    };
+    let identity = record.identity.definitions();
     let state = serde_json::to_string(record).map_err(|error| error.to_string())?;
     let masked = record
         .masked
@@ -326,7 +433,7 @@ fn render(path: &Path, record: &Record) -> Result<String> {
         .collect::<Vec<_>>()
         .join(" ");
     Ok(format!(
-        "{MARKER}{STATE_PREFIX}{state}\nargs: let\n  base = {base};\n  selected = {};\n  masked = [ {masked} ];\n  changes = {};\n  pathOf = {PATH_OF};\n  keep = bundle: !(builtins.elem (pathOf bundle) masked);\n  modify = bundle: builtins.foldl' (current: change:\n    if pathOf bundle == change.path then builtins.mapAttrs (layer: original:\n      if builtins.hasAttr layer change.layers then {{ imports = [ original change.layers.${{layer}} ]; }}\n      else original) current\n    else current) bundle changes;\nin base // {{ modules = map modify (builtins.filter keep (base.modules or [])) ++ selected; }}\n",
+        "{MARKER}{STATE_PREFIX}{state}\nargs: let\n  base = {base};\n  selected = {};\n  masked = [ {masked} ];\n  changes = {};\n  pathOf = {PATH_OF};\n  keep = bundle: !(builtins.elem (pathOf bundle) masked);\n  modify = bundle: builtins.foldl' (current: change:\n    if pathOf bundle == change.path then builtins.mapAttrs (layer: original:\n      if builtins.hasAttr layer change.layers then {{ imports = [ original change.layers.${{layer}} ]; }}\n      else original) current\n    else current) bundle changes;\nin base // {{{identity} modules = map modify (builtins.filter keep (base.modules or [])) ++ selected{system_change}; }}\n",
         record.modules, record.changes,
     ))
 }
@@ -335,6 +442,7 @@ fn render(path: &Path, record: &Record) -> Result<String> {
 pub struct CatalogContext {
     pub originals: Vec<String>,
     pub sources: Vec<String>,
+    pub identity: Identity,
 }
 
 pub struct Selector {
@@ -367,11 +475,9 @@ impl InstalledEdit {
             || self.record.changes != "[]"
             || !self.record.masked.is_empty()
         {
-            return Err(
-                "The installed selector's host settings cannot be changed by this operation."
-                    .into(),
-            );
+            return Err("The installed selector's base or manual imports changed.".into());
         }
+        self.record.identity.validate()?;
         let text = render(&selector.path, &self.record)?;
         if text.as_bytes() == selector.file.bytes {
             return Ok(());
@@ -536,6 +642,16 @@ impl Selector {
             // Loading a remote host's outputs is deferred until Rebuild.
             "true".into()
         };
+        let identity = match self.record.as_ref().map(|record| &record.base) {
+            Some(Base::Fresh {
+                username, hostname, ..
+            }) => format!(
+                "{{ username = {}; hostname = {}; }}",
+                quote(username),
+                quote(hostname)
+            ),
+            _ => "{ username = cfg.username or null; hostname = cfg.hostName or null; }".into(),
+        };
         nix_json_with_network(
             &self.path,
             !offline,
@@ -555,10 +671,63 @@ impl Selector {
                     else {{
                       originals = builtins.filter (path: path != null) (map pathOf modules);
                       sources = map toString sources;
+                      identity = {identity};
                     }}"#,
                 quote(path),
             ),
         )
+    }
+
+    pub fn identity(&self) -> Identity {
+        self.record
+            .as_ref()
+            .map_or_else(Identity::default, |record| record.identity.clone())
+    }
+
+    pub fn preview_identity<T>(
+        &self,
+        dir: &Path,
+        identity: &Identity,
+        use_selector: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        if &self.identity() == identity {
+            return use_selector(&self.path);
+        }
+        identity.validate()?;
+        let mut record = self.record.clone().unwrap_or_else(|| Record {
+            base: Base::Original,
+            modules: "[]".into(),
+            changes: "[]".into(),
+            masked: BTreeSet::new(),
+            selected: vec![],
+            repositories: vec![],
+            identity: Identity::default(),
+        });
+        record.identity = identity.clone();
+        let original = if self.backup.is_some() {
+            backup_path(&self.path)
+        } else {
+            self.path.clone()
+        };
+        let original = original
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", original.display()))?;
+        let text = render_with_original(&self.path, &record, Some(&original))?;
+        let path = dir.join(format!(
+            ".selector-preview-{}-{}.nix",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_nanos()
+        ));
+        write_atomic(&path, text.as_bytes(), 0o600, None, true)?;
+        let result = path
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", path.display()))
+            .and_then(|path| use_selector(&path));
+        let _ = fs::remove_file(path);
+        result
     }
 
     pub fn installed(&self) -> bool {
@@ -581,6 +750,7 @@ impl Selector {
         modules: String,
         selected: Vec<Selected>,
         repositories: Vec<SourceSpec>,
+        identity: Identity,
     ) -> Result<()> {
         if !self.installed() {
             return Err(
@@ -601,7 +771,9 @@ impl Selector {
             repositories,
             changes: "[]".into(),
             masked: BTreeSet::new(),
+            identity,
         };
+        record.identity.validate()?;
         if render(&self.path, &record)?.as_bytes() == self.file.bytes {
             return Ok(());
         }
@@ -649,6 +821,7 @@ impl Selector {
         masked: BTreeSet<String>,
         selected: Vec<Selected>,
         repositories: Vec<SourceSpec>,
+        identity: Identity,
     ) -> Result<()> {
         self.file.matches(&self.path)?;
         let record = Record {
@@ -661,7 +834,9 @@ impl Selector {
             masked,
             selected,
             repositories,
+            identity,
         };
+        record.identity.validate()?;
         let text = render(&self.path, &record)?;
         if self.file.bytes == text.as_bytes() {
             return Ok(());
@@ -719,6 +894,7 @@ pub fn create_selector(
         masked: BTreeSet::new(),
         selected,
         repositories,
+        identity: Identity::default(),
     };
     let text = render(path, &record)?;
     write_atomic(path, text.as_bytes(), 0o644, None, true)
@@ -829,7 +1005,7 @@ pub fn architecture() -> Result<String> {
     Ok(format!("{arch}-{os}"))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum HostPlatform {
     Linux,
     Darwin,
@@ -1055,8 +1231,15 @@ mod selector_tests {
     }"#;
 
     fn configure(path: &Path, old: &Selector, masked: BTreeSet<String>, changes: &str) -> Selector {
-        old.save("[]".into(), changes.into(), masked, vec![], vec![])
-            .unwrap();
+        old.save(
+            "[]".into(),
+            changes.into(),
+            masked,
+            vec![],
+            vec![],
+            Identity::default(),
+        )
+        .unwrap();
         Selector::read(path).unwrap().unwrap()
     }
 
@@ -1210,8 +1393,15 @@ mod selector_tests {
 
         let old = Selector::read(&config).unwrap().unwrap();
         assert!(
-            old.save("[]".into(), "[]".into(), BTreeSet::new(), vec![], vec![])
-                .is_err()
+            old.save(
+                "[]".into(),
+                "[]".into(),
+                BTreeSet::new(),
+                vec![],
+                vec![],
+                Identity::default()
+            )
+            .is_err()
         );
         assert_eq!(fs::read_to_string(&config).unwrap(), ORIGINAL);
         assert_eq!(fs::read_to_string(&backup).unwrap(), "different original");
@@ -1238,7 +1428,14 @@ mod selector_tests {
         assert!(Selector::read(&config).is_err());
         assert!(
             saved
-                .save("[]".into(), "[]".into(), BTreeSet::new(), vec![], vec![])
+                .save(
+                    "[]".into(),
+                    "[]".into(),
+                    BTreeSet::new(),
+                    vec![],
+                    vec![],
+                    Identity::default()
+                )
                 .is_err()
         );
         assert_eq!(fs::read_to_string(&config).unwrap(), edited_managed);
@@ -1364,7 +1561,7 @@ mod selector_tests {
             return;
         }
         let alternate = fixture.0.join("alternate.nix");
-        fs::write(&alternate, "{inputs}: { username = \"bob\"; system = \"aarch64-linux\"; flakeDir = \"/etc/nixos\"; modules = []; }").unwrap();
+        fs::write(&alternate, "{inputs}: { username = \"bob\"; hostName = \"alternate\"; system = \"aarch64-linux\"; flakeDir = \"/etc/nixos\"; modules = []; }").unwrap();
         let expression = format!(
             r#"
           let
@@ -1377,18 +1574,212 @@ mod selector_tests {
               home-manager.nixosModules.home-manager = {{}};
             }};
             flake = import (builtins.toPath {});
-          in (flake.outputs fake).nixosConfigurations.machine"#,
+            configs = (flake.outputs fake).nixosConfigurations;
+          in builtins.mapAttrs (name: args: args // {{ inherit name; }}) configs"#,
             quote(fixture.0.join("flake.nix").to_str().unwrap()),
         );
         let default: Value = nix_json(Path::new(""), &expression).unwrap();
         assert_eq!(
             default,
-            serde_json::json!({"system":"x86_64-linux", "username":"alice"})
+            serde_json::json!({"machine": {"name":"machine", "system":"x86_64-linux", "username":"alice"}})
         );
         let explicit: Value = nix_json(&alternate, &expression).unwrap();
         assert_eq!(
             explicit,
-            serde_json::json!({"system":"aarch64-linux", "username":"bob"})
+            serde_json::json!({"alternate": {"name":"alternate", "system":"aarch64-linux", "username":"bob"}})
+        );
+        fs::write(&alternate, r#"{inputs}: { username = "bob"; system = "aarch64-linux"; flakeDir = "/etc/nixos"; modules = []; }"#).unwrap();
+        let legacy: Value = nix_json(&alternate, &expression).unwrap();
+        assert_eq!(
+            legacy,
+            serde_json::json!({"machine": {"name":"machine", "system":"aarch64-linux", "username":"bob"}})
+        );
+    }
+    #[test]
+    fn prospective_identity_reads_relative_original_and_resolves_platform_outputs_before_save() {
+        if !nix_available() {
+            return;
+        }
+        let fixture = Fixture::new();
+        let config = fixture.0.join("config.nix");
+        let data = r#"{ username = "alice"; hostName = "workstation"; extra = 42; }"#;
+        fs::write(fixture.0.join("identity-data.nix"), data).unwrap();
+        let original =
+            "{inputs}: import ./identity-data.nix // { modules = []; flakeDir = toString ./.; }";
+        fs::write(&config, original).unwrap();
+        fs::write(
+            fixture.0.join("flake.nix"),
+            r#"{
+          outputs = {self}: let
+            cfg = import (builtins.toPath (builtins.getEnv "NIXOS_BASE_CONFIG")) { inputs = {}; };
+          in {
+            darwinConfigurations."${cfg.username}-OSX" = {};
+            nixosConfigurations.${cfg.hostName} = {};
+          };
+        }"#,
+        )
+        .unwrap();
+        let host = fixture.0.to_str().unwrap();
+        let selector = Selector::read(&config).unwrap().unwrap();
+        let identity = Identity {
+            username: Some("bob".into()),
+            hostname: Some("laptop".into()),
+        };
+        let preview_dir = fixture.0.join("different parent");
+        selector
+            .preview_identity(&preview_dir, &identity, |preview| {
+                let darwin = RebuildTarget::resolve_for(host, preview, HostPlatform::Darwin)?;
+                let linux = RebuildTarget::resolve_for(host, preview, HostPlatform::Linux)?;
+                assert_eq!(darwin.name, "bob-OSX");
+                assert_eq!(linux.name, "laptop");
+                assert!(
+                    RebuildTarget::resolve_for(
+                        &format!("{host}#alice-OSX"),
+                        preview,
+                        HostPlatform::Darwin
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    RebuildTarget::resolve_for(
+                        &format!("{host}#bob-OSX"),
+                        preview,
+                        HostPlatform::Darwin
+                    )?
+                    .name,
+                    "bob-OSX"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+        assert_eq!(fs::read_dir(&preview_dir).unwrap().count(), 0);
+        selector
+            .save(
+                "[]".into(),
+                "[]".into(),
+                BTreeSet::from(["/unrelated".into()]),
+                vec![],
+                vec![],
+                identity.clone(),
+            )
+            .unwrap();
+
+        let selector = Selector::read(&config).unwrap().unwrap();
+        assert_eq!(selector.identity(), identity);
+        assert_eq!(
+            selector
+                .catalog_context(host, true)
+                .unwrap()
+                .identity
+                .username
+                .as_deref(),
+            Some("alice")
+        );
+        assert_eq!(fs::read_to_string(backup_path(&config)).unwrap(), original);
+        selector
+            .preview_identity(&preview_dir, &Identity::default(), |preview| {
+                assert_eq!(
+                    RebuildTarget::resolve_for(host, preview, HostPlatform::Darwin)?.name,
+                    "alice-OSX"
+                );
+                Ok(())
+            })
+            .unwrap();
+        selector
+            .save(
+                "[]".into(),
+                "[]".into(),
+                selector.masked(),
+                vec![],
+                vec![],
+                Identity::default(),
+            )
+            .unwrap();
+        let reset = Selector::read(&config).unwrap().unwrap();
+        assert!(reset.identity().is_empty());
+        assert_eq!(reset.masked(), BTreeSet::from(["/unrelated".into()]));
+        let extra: u32 = nix_json(
+            &config,
+            &format!(
+                "(import (builtins.toPath {}) {{ inputs = {{}}; }}).extra",
+                quote(config.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        assert_eq!(extra, 42);
+    }
+
+    #[test]
+    fn installed_identity_edit_preserves_base_and_generates_scoped_linux_settings() {
+        let fixture = Fixture::new();
+        let config = fixture.0.join("config.nix");
+        create_selector(
+            &config,
+            "[]".into(),
+            vec![],
+            vec![],
+            "owner",
+            "machine",
+            "x86_64-linux",
+        )
+        .unwrap();
+        let selector = Selector::read(&config).unwrap().unwrap();
+        let mut record = selector.record.clone().unwrap();
+        let original = record.base.clone();
+        record.identity = Identity {
+            username: Some("new-owner".into()),
+            hostname: Some("new-node".into()),
+        };
+        let valid = InstalledEdit {
+            expected: fs::read_to_string(&config).unwrap(),
+            record,
+        };
+        valid.write(&selector).unwrap();
+        assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o644);
+        let loaded = Selector::read(&config).unwrap().unwrap();
+        assert!(loaded.record.as_ref().unwrap().base == original);
+        assert_eq!(loaded.identity(), valid.record.identity);
+        let mut invalid_record = valid.record.clone();
+        invalid_record.identity.username = Some("root".into());
+        let copy = fs::read_to_string(&config).unwrap();
+        assert!(
+            InstalledEdit {
+                expected: copy.clone(),
+                record: invalid_record
+            }
+            .write(&loaded)
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), copy);
+
+        if !nix_available() {
+            return;
+        }
+        let effect: Value = nix_json(
+            &config,
+            &format!(
+                r#"
+            let cfg = import (builtins.toPath {}) {{ inputs = {{}}; }};
+                options = (builtins.head cfg.modules).nixos {{
+                    lib.mkOverride = priority: value: {{ inherit priority value; }};
+                    lib.mkDefault = x: x;
+                }};
+            in {{ inherit (cfg) username hostName; inherit options; }}
+        "#,
+                quote(config.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            effect,
+            serde_json::json!({
+                "username": "new-owner", "hostName": "new-node",
+                "options": {
+                    "networking": {"hostName": {"value": "new-node", "priority": 90}},
+                    "users": {"users": {"new-owner": {"isNormalUser": true}}}
+                }
+            })
         );
     }
 }

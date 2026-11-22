@@ -303,35 +303,8 @@ fn linux() -> Result<(), String> {
 }
 
 fn validate_settings(request: &InstallRequest) -> Result<(), String> {
-    let hostname_valid = !request.hostname.is_empty()
-        && request.hostname.len() <= 63
-        && request.hostname.as_bytes()[0].is_ascii_alphanumeric()
-        && request
-            .hostname
-            .as_bytes()
-            .last()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && request
-            .hostname
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-');
-    if !hostname_valid {
-        return Err(
-            "Hostname must be a DNS label of 1–63 ASCII letters, digits or hyphens.".into(),
-        );
-    }
-    let username_valid = !request.username.is_empty()
-        && request.username.len() <= 32
-        && (request.username.as_bytes()[0].is_ascii_lowercase()
-            || request.username.starts_with('_'))
-        && request
-            .username
-            .bytes()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
-        && !matches!(request.username.as_str(), "root" | "nobody" | "nixbld");
-    if !username_valid {
-        return Err("Choose a normal account name using lowercase ASCII letters, digits, underscores or hyphens.".into());
-    }
+    crate::config::validate_hostname(&request.hostname)?;
+    crate::config::validate_username(&request.username, false)?;
     if request.timezone.is_empty()
         || !request.timezone.split('/').all(safe_path_component)
         || !plain_setting(&request.locale)
