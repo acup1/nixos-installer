@@ -3,6 +3,15 @@
   "title": "Метаданные модуля Nix",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "systems": {
+      "description": "Поддерживаемые целевые системы Nix. Пересекается с ограничениями платформ и слоя.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[A-Za-z0-9_]+-(linux|darwin)$", "not": {"pattern": "[\u0000-\u001f\u007f-\u009f]"}}
+    }
+  },
   "required": ["schemaVersion", "title", "description", "layers"],
   "properties": {
     "schemaVersion": {"const": 1},
@@ -23,6 +32,7 @@
         }
       }
     },
+    "systems": {"$ref": "#/$defs/systems"},
     "options": {
       "type": "array",
       "items": {
@@ -32,6 +42,7 @@
         "properties": {
           "layer": {"enum": ["nixos", "darwin", "home"]},
           "platforms": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["linux", "darwin"]}},
+          "systems": {"$ref": "#/$defs/systems"},
           "path": {
             "type": "array",
             "minItems": 1,
@@ -40,9 +51,17 @@
           "type": {"enum": ["bool", "integer", "string", "string_list", "packages"]},
           "title": {"type": "string", "minLength": 1},
           "description": {"type": "string", "minLength": 1},
+          "choices": {
+            "description": "Допустимые строковые значения. Если указано значение по умолчанию, оно должно входить в этот список.",
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "not": {"pattern": "[\u0000-\u001f\u007f-\u009f]"}}
+          },
           "default": {}
         },
         "allOf": [
+          {"if": {"required": ["choices"]}, "then": {"properties": {"type": {"const": "string"}}}},
           {"if": {"properties": {"type": {"const": "bool"}}}, "then": {"properties": {"default": {"type": "boolean"}}}},
           {"if": {"properties": {"type": {"const": "integer"}}}, "then": {"properties": {"default": {"type": "integer"}}}},
           {"if": {"properties": {"type": {"const": "string"}}}, "then": {"properties": {"default": {"type": "string"}}}},

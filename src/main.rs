@@ -4,7 +4,7 @@ mod install;
 mod read_command;
 mod ui;
 
-use catalog::{CatalogSource, Layer, OptionKind, Platform, SourceMode, SourceSpec};
+use catalog::{CatalogSource, Layer, OptionKind, SourceMode, SourceSpec};
 use config::{Choice, Location, Selected, Selector};
 use install::{BootMode, DiskLayout, FileSystem, InstallRequest};
 use serde::{Deserialize, Serialize};
@@ -160,11 +160,6 @@ impl Controller {
         let mut sources = vec![];
         let mut rows = vec![];
         let mut unavailable = vec![];
-        let platform = if state.mode == Mode::Install || cfg!(target_os = "linux") {
-            Platform::Linux
-        } else {
-            Platform::Darwin
-        };
         for (i, spec) in repositories.iter().enumerate() {
             if repositories[..i].contains(spec) {
                 return Err(format!("Duplicate repository {}", spec.repository));
@@ -204,11 +199,7 @@ impl Controller {
                         })
                 }
             };
-            for module in source
-                .modules
-                .iter()
-                .filter(|m| m.manifest.supports(platform))
-            {
+            for module in &source.modules {
                 rows.push(ModuleRow {
                     repository: i,
                     module: module.clone(),
@@ -286,6 +277,7 @@ impl Controller {
         if self.loaded != state.repositories {
             return Err("Refresh the catalog after changing repositories.".into());
         }
+        let target = state.target();
         let mut choices = vec![];
         for row in state.modules.iter().filter(|row| row.selected) {
             let source = self
@@ -302,7 +294,15 @@ impl Controller {
                     .iter()
                     .find(|o| format!("{}.{}", layer_name(o.layer), o.path.join(".")) == *key)
                     .ok_or_else(|| format!("Unknown option {key}"))?;
-                if !opt.kind.accepts(v) {
+                if !manifest.option_available_on(opt, &target) {
+                    continue;
+                }
+                if !opt.accepts(v) {
+                    if opt.choices.is_some() {
+                        return Err(format!(
+                            "Invalid value for {key}. Select an available value or restore the default on Modules."
+                        ));
+                    }
                     return Err(format!("Invalid value for {key}"));
                 }
                 settings.push((
@@ -447,7 +447,14 @@ impl Controller {
         }
 
         let saved = self.synchronized_state(state, false);
-        if selector.managed() || !new.is_empty() || !changes.is_empty() || !masked.is_empty() {
+        if selector.managed()
+            || !new.is_empty()
+            || !masked.is_empty()
+            || saved
+                .selections
+                .iter()
+                .any(|selection| !selection.values.is_empty())
+        {
             let modules = config::selection(&self.locations(false)?, &new)?;
             if selector.installed() && !effective_user_is_root()? {
                 selector.save_installed_with_sudo(
@@ -586,12 +593,20 @@ impl Controller {
                         s.revision.as_deref().unwrap_or("working tree")
                     ));
                 }
-                for c in &choices {
-                    plan.steps.push(format!(
-                        "Enable {} ({} overrides)",
-                        c.path,
-                        c.settings.len()
-                    ));
+                let target = state.target();
+                for (row, choice) in state
+                    .modules
+                    .iter()
+                    .filter(|row| row.selected)
+                    .zip(&choices)
+                {
+                    let status = if row.module.manifest.available_on(&target) {
+                        format!("{} active overrides", choice.settings.len())
+                    } else {
+                        format!("unavailable on {}; selection saved", target.system)
+                    };
+                    plan.steps
+                        .push(format!("Select {} ({status})", choice.path));
                 }
                 state.plan = Some(plan);
                 Ok("Installation plan ready".into())
@@ -1749,9 +1764,10 @@ mod controller_tests {
                 .iter()
                 .map(|row| (row.module.path.as_str(), row.selected))
                 .collect::<Vec<_>>(),
-            [("available", false), ("primary", false)]
+            [("available", false), ("foreign", false), ("primary", false)]
         );
         state.modules[0].selected = true;
+        state.modules[1].selected = true;
         editor.refresh(&mut state, true).unwrap();
         assert!(
             editor
@@ -1766,11 +1782,104 @@ mod controller_tests {
         let mut editor = controller(&root.join("state"));
         editor.refresh(&mut reopened, false).unwrap();
         assert!(reopened.modules[0].selected);
-        assert!(!reopened.modules[1].selected);
+        assert!(reopened.modules[1].selected);
+        assert!(
+            !reopened.modules[1]
+                .module
+                .manifest
+                .available_on(&reopened.target())
+        );
+        assert!(!reopened.modules[2].selected);
         assert_eq!(Selector::read(&path).unwrap().unwrap().masked(), mask);
         let selector = fs::read_to_string(&path).unwrap();
         assert!(selector.contains(&config::quote(explicit.to_str().unwrap())));
+        assert!(
+            selector
+                .lines()
+                .any(|line| line.contains(r#" + "/foreign""#))
+        );
         assert!(!selector.contains("builtins.fetchGit"));
+    }
+
+    #[test]
+    fn save_rejects_a_removed_theme_and_writes_an_allowed_theme() {
+        let fixture = Fixture::new();
+        let root = fixture.0.canonicalize().unwrap();
+        let checkout = root.join("catalog");
+        let component = checkout.join("theme");
+        fs::create_dir_all(&component).unwrap();
+        fs::write(component.join("default.nix"), "{ home = {}; }").unwrap();
+        fs::write(
+            component.join("module.json"),
+            r#"{
+            "schemaVersion": 1,
+            "title": "Theme",
+            "description": "Theme catalogue",
+            "layers": { "home": ["linux", "darwin"] },
+            "options": [{"layer": "home", "path": ["appearance", "theme"],
+                "title": "Theme", "description": "Color scheme", "type": "string",
+                "choices": ["nord", "light"], "default": "nord"},
+                {"layer": "home", "path": ["appearance", "other"], "type": "bool",
+                    "title": "Other theme", "description": "Unavailable on this system",
+                    "systems": ["other-linux", "other-darwin"]}]
+        }"#,
+        )
+        .unwrap();
+        let path = root.join("config.nix");
+        let original = "{ inputs }: { modules = []; }";
+        fs::write(&path, original).unwrap();
+        let spec = SourceSpec {
+            repository: checkout.display().to_string(),
+            reference: "HEAD".into(),
+            mode: SourceMode::Local,
+        };
+        let source = catalog::discover_cached(&spec, &root.join("cache")).unwrap();
+        let mut editor = controller(&root.join("state"));
+        let mut state = Session::new(
+            Mode::Configure,
+            vec![spec.clone()],
+            default_request(),
+            root.display().to_string(),
+            path.display().to_string(),
+        );
+        state.modules.push(ModuleRow {
+            repository: 0,
+            module: source.modules[0].clone(),
+            selected: true,
+            values: BTreeMap::from([("home.appearance.theme".into(), "removed".into())]),
+        });
+        editor.loaded.push(spec);
+        editor.sources.push(source);
+        editor.inspected_host = state.flake.clone();
+        editor.selector = Selector::read(&path).unwrap();
+        assert!(
+            editor
+                .save(&mut state)
+                .unwrap_err()
+                .contains("home.appearance.theme")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("pre-installer.nix").exists());
+
+        state.modules[0]
+            .values
+            .insert("home.appearance.theme".into(), "light".into());
+        state.modules[0]
+            .values
+            .insert("home.appearance.other".into(), true.into());
+        editor.save(&mut state).unwrap();
+        let updated = Selector::read(&path).unwrap().unwrap();
+        assert_eq!(
+            updated.selections()[0].values["home.appearance.theme"],
+            "light"
+        );
+        assert_eq!(
+            updated.selections()[0].values["home.appearance.other"],
+            true
+        );
+        let active = fs::read_to_string(path).unwrap();
+        assert!(active.contains(r#""appearance"."theme" = lib.mkForce "light""#));
+        assert!(!active.contains(r#""appearance"."other" = lib.mkForce"#));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::catalog::{
-    CatalogModule, Layer, ManifestOption, OptionKind, Platform, SourceMode, SourceSpec,
+    CatalogModule, Layer, ManifestOption, OptionKind, Platform, SourceMode, SourceSpec, Target,
 };
 use crate::install::{
     BlockDevice, BootMode, DiskLayout, FileSystem, InstallPlan, InstallRequest, confirmation_token,
@@ -63,6 +63,10 @@ impl Session {
         }
     }
 
+    pub fn target(&self) -> Target {
+        Target::new(target_platform(self.mode), std::env::consts::ARCH)
+    }
+
     pub fn host_flake(&self) -> &str {
         if self.flake.is_empty() {
             &self.detected_flake
@@ -123,7 +127,7 @@ impl Page {
         match self {
             Self::Sources => "Add local or Git module repositories, then load their catalog.",
             Self::Modules => {
-                "Space toggles modules, packages and switches. Ctrl+R restores a switch's default."
+                "Space toggles switches. Enter opens options. Ctrl+R restores a default."
             }
             Self::System => "Set the hostname, user and desktop for the new system.",
             Self::Storage => "Choose how to prepare or reuse the target filesystem.",
@@ -185,12 +189,13 @@ enum Control {
     Edit(Field),
     SelectModule(usize),
     ToggleParameter(usize, Vec<usize>),
-    ResetPackages(usize, usize),
+    ResetParameter(usize, usize),
     AddRepository,
     ToggleSource(usize),
     RemoveRepository(usize),
     Change(Setting),
     Choose(DeviceSlot),
+    ChooseParameter(usize, usize),
     Page(usize),
     ShowPlan,
     Send(Action),
@@ -242,12 +247,19 @@ enum EditTarget {
 }
 
 struct Choice {
-    value: String,
+    value: Option<String>,
     label: String,
 }
 
+#[derive(Clone, Copy)]
+enum PickerTarget {
+    Device(DeviceSlot),
+    Parameter(usize, usize),
+}
+
 struct Picker {
-    slot: DeviceSlot,
+    target: PickerTarget,
+    title: String,
     choices: Vec<Choice>,
     cursor: usize,
     offset: usize,
@@ -637,7 +649,7 @@ impl Ui {
                 let mut rows = vec![Row::field("Filter modules", &self.search, Field::Search)];
                 let query = self.search.to_lowercase();
                 let mut found = false;
-                let platform = target_platform(state.mode);
+                let target = state.target();
                 if state.catalog_warning.is_some() {
                     rows.push(Row::note(
                         "Some module sources are unavailable. Refresh before applying changes.",
@@ -653,6 +665,13 @@ impl Ui {
                         && !module.path.to_lowercase().contains(&query)
                         && !module.manifest.title.to_lowercase().contains(&query)
                         && !module.manifest.description.to_lowercase().contains(&query)
+                        && !module.manifest.options.iter().any(|option| {
+                            option.title.to_lowercase().contains(&query)
+                                || option
+                                    .path
+                                    .iter()
+                                    .any(|part| part.to_lowercase().contains(&query))
+                        })
                     {
                         continue;
                     }
@@ -663,13 +682,12 @@ impl Ui {
                         module_label(row, state.repositories.len()),
                         module.manifest.title
                     );
-                    if !module.manifest.supports(platform) {
-                        rows.push(Row::note(format!("{title} · unavailable on this platform")));
-                        continue;
-                    }
-                    rows.push(Row::action(title, Control::SelectModule(index)));
+                    rows.push(mark_available(
+                        Row::action(title, Control::SelectModule(index)),
+                        module.manifest.available_on(&target),
+                    ));
                     if row.selected {
-                        rows.extend(parameter_rows(index, row, platform));
+                        rows.extend(parameter_rows(index, row, &target));
                     }
                 }
                 if !found {
@@ -853,25 +871,43 @@ impl Ui {
             .iter()
             .filter(|module| module.selected)
             .collect::<Vec<_>>();
+        let target = state.target();
         rows.push(Row::note(format!(
-            "{} selected components · {} repositories",
+            "{} selected components · {} repositories · {}",
             active.len(),
-            state.repositories.len()
+            state.repositories.len(),
+            target.system,
         )));
         for module in active {
-            rows.push(Row::note(format!(
-                "  {} · {} overrides",
-                module_label(module, state.repositories.len()),
-                module.values.len()
-            )));
-            for option in &module.module.manifest.options {
+            let manifest = &module.module.manifest;
+            let active_overrides = manifest
+                .options
+                .iter()
+                .filter(|option| {
+                    manifest.option_available_on(option, &target)
+                        && module.values.contains_key(&option_key(option))
+                })
+                .count();
+            rows.push(mark_available(
+                Row::note(format!(
+                    "  {} · {} active / {} saved overrides",
+                    module_label(module, state.repositories.len()),
+                    active_overrides,
+                    module.values.len(),
+                )),
+                manifest.available_on(&target),
+            ));
+            for option in &manifest.options {
                 if let Some(value) = module.values.get(&option_key(option)) {
-                    rows.push(Row::note(format!(
-                        "    {} · {} = {}",
-                        layer_name(option.layer),
-                        option.title,
-                        option_text(option.kind, value)
-                    )));
+                    rows.push(mark_available(
+                        Row::note(format!(
+                            "    {} · {} = {}",
+                            layer_name(option.layer),
+                            option.title,
+                            option_text(option.kind, value)
+                        )),
+                        manifest.option_available_on(option, &target),
+                    ));
                 }
             }
         }
@@ -1018,16 +1054,16 @@ impl Ui {
                 Outcome::Continue
             }
             Event::Key(18) => {
-                if let Some(Control::ToggleParameter(row, parameters)) =
-                    rows.get(self.focus).and_then(|r| r.control.as_ref())
-                {
-                    let module = &mut state.modules[*row];
-                    for &parameter in parameters {
-                        module
-                            .values
-                            .remove(&option_key(&module.module.manifest.options[parameter]));
+                match rows.get(self.focus).and_then(|row| row.control.as_ref()) {
+                    Some(Control::ToggleParameter(row, parameters)) => {
+                        for &parameter in parameters {
+                            reset_parameter(state, *row, parameter);
+                        }
                     }
-                    state.plan = None;
+                    Some(Control::ChooseParameter(row, parameter)) => {
+                        reset_parameter(state, *row, *parameter);
+                    }
+                    _ => {}
                 }
                 Outcome::Continue
             }
@@ -1126,12 +1162,8 @@ impl Ui {
                 }
                 state.plan = None;
             }
-            Some(Control::ResetPackages(row, parameter)) => {
-                let module = &mut state.modules[row];
-                module
-                    .values
-                    .remove(&option_key(&module.module.manifest.options[parameter]));
-                state.plan = None;
+            Some(Control::ResetParameter(row, parameter)) => {
+                reset_parameter(state, row, parameter);
             }
             Some(Control::AddRepository) => {
                 state.repositories.push(SourceSpec {
@@ -1179,9 +1211,50 @@ impl Ui {
                     ));
                 } else {
                     self.modal = Some(Modal::Pick(Picker {
-                        slot,
+                        target: PickerTarget::Device(slot),
+                        title: match slot {
+                            DeviceSlot::Disk => "Choose installation disk",
+                            DeviceSlot::Root => "Choose root partition",
+                            DeviceSlot::Esp => "Choose EFI System Partition",
+                            DeviceSlot::AlongsideEsp => "Dedicated or existing EFI partition",
+                            DeviceSlot::BootDisk => "Choose boot disk",
+                            DeviceSlot::PartitionEditor => "Select disk for cfdisk",
+                        }
+                        .into(),
                         choices,
                         cursor: 0,
+                        offset: 0,
+                    }));
+                }
+            }
+            Some(Control::ChooseParameter(row, parameter)) => {
+                let module = &state.modules[row];
+                let option = &module.module.manifest.options[parameter];
+                if let Some(values) = &option.choices {
+                    let current = module
+                        .values
+                        .get(&option_key(option))
+                        .and_then(Value::as_str);
+                    let cursor = current
+                        .and_then(|current| values.iter().position(|value| value == current))
+                        .map_or(0, |index| index + 1);
+                    let default = option.default.as_ref().and_then(Value::as_str);
+                    let mut choices = vec![Choice {
+                        value: None,
+                        label: default.map_or_else(
+                            || "Use module default".into(),
+                            |value| format!("Use module default ({})", choice_text(value)),
+                        ),
+                    }];
+                    choices.extend(values.iter().map(|value| Choice {
+                        value: Some(value.clone()),
+                        label: choice_text(value).into(),
+                    }));
+                    self.modal = Some(Modal::Pick(Picker {
+                        target: PickerTarget::Parameter(row, parameter),
+                        title: option.title.clone(),
+                        choices,
+                        cursor,
                         offset: 0,
                     }));
                 }
@@ -1278,10 +1351,7 @@ impl Ui {
                     }
                     Event::Key(18) => {
                         if let EditTarget::Field(Field::Parameter(row, parameter)) = editor.target {
-                            let module = &mut state.modules[row];
-                            let key = option_key(&module.module.manifest.options[parameter]);
-                            module.values.remove(&key);
-                            state.plan = None;
+                            reset_parameter(state, row, parameter);
                             return Outcome::Continue;
                         }
                     }
@@ -1311,6 +1381,13 @@ impl Ui {
             Modal::Pick(mut picker) => {
                 let select = match event {
                     Event::Key(27) => return Outcome::Continue,
+                    Event::Key(18) => {
+                        if let PickerTarget::Parameter(row, parameter) = picker.target {
+                            reset_parameter(state, row, parameter);
+                            return Outcome::Continue;
+                        }
+                        false
+                    }
                     Event::Key(KEY_UP | BACK_TAB) => {
                         picker.cursor = picker.cursor.saturating_sub(1);
                         false
@@ -1344,14 +1421,29 @@ impl Ui {
                 };
                 if select {
                     let choice = picker.choices.swap_remove(picker.cursor);
-                    if matches!(picker.slot, DeviceSlot::PartitionEditor) {
-                        return self.activate(
-                            state,
-                            Some(Control::Confirm(Action::EditPartitions(choice.value))),
-                        );
+                    match (picker.target, choice.value) {
+                        (PickerTarget::Device(DeviceSlot::PartitionEditor), Some(disk)) => {
+                            return self.activate(
+                                state,
+                                Some(Control::Confirm(Action::EditPartitions(disk))),
+                            );
+                        }
+                        (PickerTarget::Device(slot), Some(device)) => {
+                            set_device(&mut state.install.layout, slot, device);
+                            state.plan = None;
+                        }
+                        (PickerTarget::Parameter(row, parameter), Some(value)) => {
+                            if let Err(error) =
+                                self.set_field(state, Field::Parameter(row, parameter), &value)
+                            {
+                                self.failure("Invalid selection", error);
+                            }
+                        }
+                        (PickerTarget::Parameter(row, parameter), None) => {
+                            reset_parameter(state, row, parameter);
+                        }
+                        (PickerTarget::Device(_), None) => {}
                     }
-                    set_device(&mut state.install.layout, picker.slot, choice.value);
-                    state.plan = None;
                 } else {
                     self.modal = Some(Modal::Pick(picker));
                 }
@@ -1454,6 +1546,9 @@ impl Ui {
                     value
                 };
                 let value = parse_option(option.kind, input)?;
+                if !option.accepts(&value) {
+                    return Err("Choose a value from the list.".into());
+                }
                 module.values.insert(option_key(option), value);
             }
             Field::Flake => {
@@ -1601,7 +1696,7 @@ fn device_choices(devices: &[BlockDevice], layout: &DiskLayout, slot: DeviceSlot
                     label.push_str(&format!(" · {}", device.mountpoints.join(", ")));
                 }
                 choices.push(Choice {
-                    value: device.path.clone(),
+                    value: Some(device.path.clone()),
                     label,
                 });
             }
@@ -1611,7 +1706,7 @@ fn device_choices(devices: &[BlockDevice], layout: &DiskLayout, slot: DeviceSlot
     let mut choices = Vec::new();
     if let (DiskLayout::Alongside { disk, .. }, DeviceSlot::AlongsideEsp) = (layout, slot) {
         choices.push(Choice {
-            value: String::new(),
+            value: Some(String::new()),
             label: "Create a dedicated EFI partition".into(),
         });
         if let Some(target) = devices.iter().find(|device| device.path == *disk) {
@@ -1767,12 +1862,17 @@ impl Ui {
             );
             top += 1;
         }
+        let subtitle = if page == Page::Modules {
+            format!("{} · {}", state.target().system, page.subtitle())
+        } else {
+            page.subtitle().into()
+        };
         line(
             frame,
             top,
             content.x + 2,
             content.w - 4,
-            page.subtitle(),
+            &subtitle,
             MUTED,
             PANEL,
         );
@@ -1993,15 +2093,7 @@ fn render_picker(
     picker: &mut Picker,
     hits: &mut Vec<(Area, usize)>,
 ) {
-    let title = match picker.slot {
-        DeviceSlot::Disk => "Choose installation disk",
-        DeviceSlot::Root => "Choose root partition",
-        DeviceSlot::Esp => "Choose EFI System Partition",
-        DeviceSlot::AlongsideEsp => "Dedicated or existing EFI partition",
-        DeviceSlot::BootDisk => "Choose boot disk",
-        DeviceSlot::PartitionEditor => "Select disk for cfdisk",
-    };
-    box_panel(frame, area, title);
+    box_panel(frame, area, &picker.title);
     let visible = (area.h - 4).max(1) as usize;
     keep_visible(
         picker.cursor,
@@ -2034,7 +2126,11 @@ fn render_picker(
         area.y + area.h - 2,
         area.x + 2,
         area.w - 14,
-        "Enter selects · Esc cancels",
+        if matches!(picker.target, PickerTarget::Parameter(..)) {
+            "Enter selects · Ctrl+R resets · Esc cancels"
+        } else {
+            "Enter selects · Esc cancels"
+        },
         MUTED,
         PANEL,
     );
@@ -2159,46 +2255,74 @@ impl ModuleRow {
     }
 }
 
-fn parameter_rows(index: usize, row: &ModuleRow, platform: Platform) -> Vec<Row> {
+fn reset_parameter(state: &mut Session, row: usize, parameter: usize) {
+    let module = &mut state.modules[row];
+    module
+        .values
+        .remove(&option_key(&module.module.manifest.options[parameter]));
+    state.plan = None;
+}
+
+fn choice_text(value: &str) -> &str {
+    if value.is_empty() { "\"\"" } else { value }
+}
+
+fn mark_available(mut row: Row, available: bool) -> Row {
+    if !available {
+        row.text = format!("Unavailable · {}", row.text.trim_start());
+        row.color = MUTED;
+    }
+    row
+}
+
+fn parameter_rows(index: usize, row: &ModuleRow, target: &Target) -> Vec<Row> {
     let manifest = &row.module.manifest;
-    let visible = manifest.options.iter().enumerate().filter(|(_, option)| {
-        option
-            .platforms
-            .as_ref()
-            .unwrap_or(&manifest.layers[&option.layer])
-            .contains(&platform)
-    });
-    // A system service and its Home Manager configuration share one package switch.
-    let mut packages = BTreeMap::<&[String], Vec<usize>>::new();
-    for (i, option) in visible.clone() {
+    let available = |option: &ManifestOption| manifest.option_available_on(option, target);
+    // Group matching package paths without making an active switch change
+    // the saved value for an unavailable layer of the same package.
+    let mut packages = BTreeMap::<(&[String], bool), Vec<usize>>::new();
+    for (i, option) in manifest.options.iter().enumerate() {
         if is_package_switch(option) {
-            packages.entry(&option.path).or_default().push(i);
+            packages
+                .entry((&option.path, available(option)))
+                .or_default()
+                .push(i);
         }
     }
     let mut rows = Vec::new();
-    for (i, option) in visible {
+    for (i, option) in manifest.options.iter().enumerate() {
+        let active = available(option);
         let saved = row.values.get(&option_key(option));
         let label = format!("{} · {}", layer_name(option.layer), option.title);
-        if option.kind == OptionKind::Packages {
-            if saved.is_some() {
-                rows.push(Row::action(
-                    format!(
-                        "  {} · Restore module packages (legacy replacement active)",
-                        layer_name(option.layer)
-                    ),
-                    Control::ResetPackages(index, i),
-                ));
+        let setting = if option.kind == OptionKind::Packages {
+            if saved.is_none() {
+                continue;
             }
-            continue;
-        }
-        if option.kind == OptionKind::Bool {
+            Row::action(
+                format!(
+                    "  {} · Restore module packages (legacy replacement active)",
+                    layer_name(option.layer)
+                ),
+                Control::ResetParameter(index, i),
+            )
+        } else if option.kind == OptionKind::Bool {
             let (targets, label) = if is_package_switch(option) {
-                let Some(targets) = packages.remove(option.path.as_slice()) else {
+                let Some(targets) = packages.remove(&(option.path.as_slice(), active)) else {
                     continue;
                 };
-                (targets, option.title.as_str())
+                let label = if active {
+                    option.title.clone()
+                } else {
+                    let layers = targets
+                        .iter()
+                        .map(|&i| layer_name(manifest.options[i].layer))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{} · {layers}", option.title)
+                };
+                (targets, label)
             } else {
-                (vec![i], label.as_str())
+                (vec![i], label)
             };
             let mark = if targets.iter().all(|&i| row.boolean(i) == Some(true)) {
                 "[×]"
@@ -2207,22 +2331,34 @@ fn parameter_rows(index: usize, row: &ModuleRow, platform: Platform) -> Vec<Row>
             } else {
                 "[–]"
             };
-            rows.push(Row::action(
+            Row::action(
                 format!("  {mark} {label}"),
                 Control::ToggleParameter(index, targets),
-            ));
+            )
+        } else if option.choices.is_some() {
+            let display = match saved {
+                Some(value) if option.accepts(value) => {
+                    choice_text(value.as_str().unwrap_or_default()).into()
+                }
+                Some(value) => format!("{} (unavailable value)", option_text(option.kind, value)),
+                None => option.default.as_ref().and_then(Value::as_str).map_or_else(
+                    || "Default".into(),
+                    |value| format!("{} (default)", choice_text(value)),
+                ),
+            };
+            Row::action(
+                format!("  {label:<16} {display}  ›"),
+                Control::ChooseParameter(index, i),
+            )
         } else {
             let display = match (saved, &option.default) {
                 (Some(v), _) => option_text(option.kind, v),
                 (None, Some(v)) => format!("{} (default)", option_text(option.kind, v)),
                 _ => "Default".into(),
             };
-            rows.push(Row::field(
-                &format!("  {label}"),
-                &display,
-                Field::Parameter(index, i),
-            ));
-        }
+            Row::field(&format!("  {label}"), &display, Field::Parameter(index, i))
+        };
+        rows.push(mark_available(setting, active));
     }
     rows
 }
@@ -2461,13 +2597,16 @@ mod tests {
                     title: "Example".into(),
                     description: "Example component".into(),
                     layers: BTreeMap::from([(Layer::Home, vec![target_platform(state.mode)])]),
+                    systems: None,
                     options: vec![ManifestOption {
                         layer: Layer::Home,
                         platforms: None,
+                        systems: None,
                         path: vec!["example".into(), "port".into()],
                         title: "Port".into(),
                         description: "Service port".into(),
                         kind: OptionKind::Integer,
+                        choices: None,
                         default: Some(json!(5001)),
                     }],
                 },
@@ -2488,6 +2627,98 @@ mod tests {
     }
 
     #[test]
+    fn theme_picker_supports_keyboard_mouse_and_restoring_default() {
+        let mut state = session();
+        let key = "home.appearance.theme";
+        let manifest = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "title": "Example",
+            "description": "Example themes",
+            "layers": {"home": ["linux", "darwin"]},
+            "options": [{"layer": "home", "path": ["appearance", "theme"],
+                "title": "Theme", "description": "Color scheme", "type": "string",
+                "choices": ["nord", "light", ""], "default": "nord"},
+                {"layer": "home", "path": ["appearance", "name"],
+                    "title": "Name", "description": "Free text", "type": "string"}]
+        }))
+        .unwrap();
+        state.modules.push(ModuleRow {
+            repository: 0,
+            selected: true,
+            values: BTreeMap::from([(key.into(), json!("removed"))]),
+            module: CatalogModule {
+                path: "theme".into(),
+                manifest,
+            },
+        });
+        let mut ui = Ui {
+            page: 1,
+            ..Ui::default()
+        };
+        let mut frame = FrameBuffer::new(98, 26);
+        ui.focus = ui
+            .rows(&state)
+            .iter()
+            .position(|row| matches!(row.control, Some(Control::ChooseParameter(0, 0))))
+            .unwrap();
+        assert!(
+            ui.rows(&state)[ui.focus]
+                .text
+                .contains("removed (unavailable value)")
+        );
+        assert!(
+            ui.set_field(&mut state, Field::Parameter(0, 0), "unknown")
+                .is_err()
+        );
+        ui.event(&mut state, Event::Key(13));
+        ui.render(&mut frame, &state);
+        assert!((0..26).any(|line| frame_text(&frame, line).contains("Use module default (nord)")));
+        assert!((0..26).any(|line| frame_text(&frame, line).contains("light")));
+        ui.event(&mut state, Event::Key(KEY_DOWN));
+        ui.event(&mut state, Event::Key(KEY_DOWN));
+        ui.event(&mut state, Event::Key(13));
+        assert_eq!(state.modules[0].values[key], json!("light"));
+
+        ui.event(&mut state, Event::Key(13));
+        assert!(matches!(&ui.modal, Some(Modal::Pick(picker)) if picker.cursor == 2));
+        ui.event(&mut state, Event::Key(27));
+        assert_eq!(state.modules[0].values[key], json!("light"));
+
+        ui.event(&mut state, Event::Key(13));
+        ui.render(&mut frame, &state);
+        let area = ui
+            .picker_hits
+            .iter()
+            .find(|(_, index)| *index == 3)
+            .unwrap()
+            .0;
+        ui.event(
+            &mut state,
+            Event::Mouse(Mouse {
+                x: area.x as u16,
+                y: area.y as u16,
+                event: MouseEvent::LEFT,
+                ..Mouse::default()
+            }),
+        );
+        assert_eq!(state.modules[0].values[key], json!(""));
+        ui.event(&mut state, Event::Key(18));
+        assert!(!state.modules[0].values.contains_key(key));
+        assert!(ui.rows(&state)[ui.focus].text.contains("nord (default)"));
+        assert!(
+            ui.rows(&state)
+                .iter()
+                .any(|row| matches!(row.control, Some(Control::Edit(Field::Parameter(0, 1)))))
+        );
+        ui.set_field(&mut state, Field::Parameter(0, 1), " custom text ")
+            .unwrap();
+        assert_eq!(
+            state.modules[0].values["home.appearance.name"],
+            json!(" custom text ")
+        );
+    }
+
+    #[test]
     fn legacy_package_override_is_preserved_until_reset() {
         let mut state = session();
         let platform = target_platform(state.mode);
@@ -2505,6 +2736,7 @@ mod tests {
                     title: "Sample".into(),
                     description: "Sample".into(),
                     layers: BTreeMap::from([(Layer::Home, vec![platform])]),
+                    systems: None,
                     options: vec![option],
                 },
             },
@@ -2517,12 +2749,12 @@ mod tests {
         ui.focus = ui
             .rows(&state)
             .iter()
-            .position(|r| matches!(r.control, Some(Control::ResetPackages(..))))
+            .position(|r| matches!(r.control, Some(Control::ResetParameter(..))))
             .unwrap();
         ui.event(&mut state, Event::Key(13));
         assert!(ui.modal.is_none());
         assert!(state.modules[0].values.is_empty());
-        assert!(parameter_rows(0, &state.modules[0], platform).is_empty());
+        assert!(parameter_rows(0, &state.modules[0], &state.target()).is_empty());
     }
 
     #[test]
@@ -2561,6 +2793,7 @@ mod tests {
                         (Layer::Home, vec![platform]),
                         (system_layer, vec![platform]),
                     ]),
+                    systems: None,
                     options,
                 },
             },
@@ -2606,6 +2839,114 @@ mod tests {
         assert_eq!(state.modules[0].values["home.signal"], true);
         ui.event(&mut state, Event::Key(18));
         assert!(state.modules[0].values.is_empty());
+    }
+
+    #[test]
+    fn unavailable_modules_and_duplicate_package_layers_remain_selectable() {
+        let mut state = session();
+        let target = state.target();
+        let foreign = if target.platform == Platform::Linux {
+            "darwin"
+        } else {
+            "linux"
+        };
+        let layer = if target.platform == Platform::Linux {
+            "darwin"
+        } else {
+            "nixos"
+        };
+        let mut modules = vec![];
+        for (path, manifest) in [
+            (
+                "tool",
+                json!({
+                    "schemaVersion": 1, "title": "Toolbox", "description": "Applications",
+                    "layers": {"home": ["linux", "darwin"], layer: [foreign]},
+                    "options": [
+                        {"layer":"home","path":["components","tool","enabledPackages","daemon"],
+                            "type":"bool","title":"Daemon","description":"Available tool","default":true},
+                        {"layer":layer,"path":["components","tool","enabledPackages","daemon"],
+                            "type":"bool","title":"Daemon","description":"Foreign layer","default":true},
+                        {"layer":"home","path":["components","tool","enabledPackages","intel-tool"],
+                            "type":"bool","title":"Intel tool","description":"System-specific tool",
+                            "systems":[format!("other-{foreign}")],"default":true}
+                    ]
+                }),
+            ),
+            (
+                "foreign",
+                json!({
+                    "schemaVersion": 1, "title": "Foreign app", "description": "Other OS",
+                    "layers": {layer: [foreign]}
+                }),
+            ),
+        ] {
+            modules.push(ModuleRow {
+                repository: 0,
+                selected: false,
+                values: BTreeMap::new(),
+                module: CatalogModule {
+                    path: path.into(),
+                    manifest: serde_json::from_value(manifest).unwrap(),
+                },
+            });
+        }
+        state.modules = modules;
+        state.modules[0].selected = true;
+        let mut ui = Ui {
+            page: 1,
+            search: "intel-tool".into(),
+            ..Ui::default()
+        };
+        let rows = ui.rows(&state);
+        assert!(
+            rows.iter()
+                .any(|row| row.text.starts_with("Unavailable") && row.text.contains("Intel tool"))
+        );
+        assert!(!rows.iter().any(|row| row.text.contains("Foreign app")));
+        let active = rows
+            .iter()
+            .find(|row| row.text.contains("[×] Daemon") && !row.text.starts_with("Unavailable"))
+            .unwrap();
+        let foreign_switch = rows
+            .iter()
+            .find(|row| {
+                row.text.contains(&format!("Daemon · {layer}"))
+                    && row.text.starts_with("Unavailable")
+            })
+            .unwrap();
+        ui.activate(&mut state, active.control.clone());
+        assert_eq!(
+            state.modules[0].values,
+            BTreeMap::from([(
+                "home.components.tool.enabledPackages.daemon".into(),
+                json!(false)
+            )])
+        );
+        ui.activate(&mut state, foreign_switch.control.clone());
+        assert_eq!(
+            state.modules[0].values[&format!("{layer}.components.tool.enabledPackages.daemon")],
+            false
+        );
+        ui.search.clear();
+        let rows = ui.rows(&state);
+        let unavailable = rows
+            .iter()
+            .find(|row| row.text.starts_with("Unavailable") && row.text.contains("Foreign app"))
+            .unwrap();
+        ui.activate(&mut state, unavailable.control.clone());
+        assert!(state.modules[1].selected);
+        let review = ui.review_rows(&state);
+        assert!(
+            review
+                .iter()
+                .any(|row| row.text.contains("1 active / 2 saved overrides"))
+        );
+        assert!(
+            review
+                .iter()
+                .any(|row| row.text.starts_with("Unavailable") && row.text.contains("foreign"))
+        );
     }
 
     #[test]

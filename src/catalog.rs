@@ -56,6 +56,25 @@ pub enum Platform {
     Darwin,
 }
 
+#[derive(Clone, Debug)]
+pub struct Target {
+    pub platform: Platform,
+    pub system: String,
+}
+
+impl Target {
+    pub fn new(platform: Platform, architecture: &str) -> Self {
+        let os = match platform {
+            Platform::Linux => "linux",
+            Platform::Darwin => "darwin",
+        };
+        Self {
+            platform,
+            system: format!("{architecture}-{os}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OptionKind {
@@ -72,11 +91,23 @@ pub struct ManifestOption {
     pub layer: Layer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<Platform>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub systems: Option<Vec<String>>,
     pub path: Vec<String>,
     pub title: String,
     pub description: String,
     #[serde(rename = "type")]
     pub kind: OptionKind,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub choices: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
 }
@@ -88,6 +119,12 @@ pub struct Manifest {
     pub title: String,
     pub description: String,
     pub layers: BTreeMap<Layer, Vec<Platform>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub systems: Option<Vec<String>>,
     #[serde(default)]
     pub options: Vec<ManifestOption>,
 }
@@ -118,11 +155,49 @@ impl OptionKind {
     }
 }
 
+fn deserialize_string_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    Vec::deserialize(deserializer).map(Some)
+}
+
+impl ManifestOption {
+    pub fn accepts(&self, value: &Value) -> bool {
+        self.kind.accepts(value)
+            && self.choices.as_ref().is_none_or(|choices| {
+                value
+                    .as_str()
+                    .is_some_and(|value| choices.iter().any(|choice| choice == value))
+            })
+    }
+}
+
 impl Manifest {
     pub fn supports(&self, platform: Platform) -> bool {
         self.layers
             .values()
             .any(|platforms| platforms.contains(&platform))
+    }
+
+    pub fn available_on(&self, target: &Target) -> bool {
+        self.supports(target.platform)
+            && self
+                .systems
+                .as_ref()
+                .is_none_or(|systems| systems.contains(&target.system))
+    }
+
+    pub fn option_available_on(&self, option: &ManifestOption, target: &Target) -> bool {
+        self.available_on(target)
+            && option
+                .platforms
+                .as_ref()
+                .unwrap_or(&self.layers[&option.layer])
+                .contains(&target.platform)
+            && option
+                .systems
+                .as_ref()
+                .is_none_or(|systems| systems.contains(&target.system))
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -154,6 +229,10 @@ impl Manifest {
             }
         }
 
+        if let Some(systems) = &self.systems {
+            validate_systems(systems, |platform| self.supports(platform))?;
+        }
+
         let mut paths: BTreeSet<(Layer, &[String])> = BTreeSet::new();
         let mut keys = BTreeSet::new();
         for option in &self.options {
@@ -174,18 +253,47 @@ impl Manifest {
             {
                 return Err(format!("Неверные платформы параметра {:?}", option.path));
             }
+            if let Some(systems) = &option.systems {
+                let platforms = option
+                    .platforms
+                    .as_ref()
+                    .unwrap_or(&self.layers[&option.layer]);
+                validate_systems(systems, |platform| platforms.contains(&platform))
+                    .map_err(|error| format!("{}: {:?}", error, option.path))?;
+                if self.systems.as_ref().is_some_and(|module_systems| {
+                    !systems.iter().all(|system| module_systems.contains(system))
+                }) {
+                    return Err(format!(
+                        "Системы параметра {:?} выходят за пределы систем модуля",
+                        option.path
+                    ));
+                }
+            }
             if !paths.insert((option.layer, &option.path))
                 || !keys.insert((option.layer, option.path.join(".")))
             {
                 return Err(format!("Параметр {:?} указан дважды", option.path));
             }
+            if let Some(choices) = &option.choices
+                && (option.kind != OptionKind::String
+                    || choices.is_empty()
+                    || choices
+                        .iter()
+                        .any(|choice| choice.chars().any(char::is_control))
+                    || choices.iter().collect::<BTreeSet<_>>().len() != choices.len())
+            {
+                return Err(format!(
+                    "Неверный список допустимых значений параметра {:?}",
+                    option.path
+                ));
+            }
             if option
                 .default
                 .as_ref()
-                .is_some_and(|value| !option.kind.accepts(value) || !safe_default(value))
+                .is_some_and(|value| !option.accepts(value) || !safe_default(value))
             {
                 return Err(format!(
-                    "Значение по умолчанию не соответствует типу {:?}",
+                    "Недопустимое значение по умолчанию для параметра {:?}",
                     option.path
                 ));
             }
@@ -204,6 +312,32 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+fn validate_systems(systems: &[String], allows: impl Fn(Platform) -> bool) -> Result<(), String> {
+    if systems.is_empty() || systems.iter().collect::<BTreeSet<_>>().len() != systems.len() {
+        return Err("Список систем должен быть непустым и без повторов".into());
+    }
+    for system in systems {
+        let platform = system.split_once('-').and_then(|(architecture, os)| {
+            if architecture.is_empty()
+                || !architecture
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return None;
+            }
+            match os {
+                "linux" => Some(Platform::Linux),
+                "darwin" => Some(Platform::Darwin),
+                _ => None,
+            }
+        });
+        if !platform.is_some_and(&allows) {
+            return Err(format!("Недопустимая целевая система {system}"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_label(text: &str, field: &str) -> Result<(), String> {
@@ -1164,6 +1298,91 @@ mod tests {
                 .unwrap_err()
                 .contains("Запись кеша повреждена")
         );
+    }
+
+    #[test]
+    fn systems_narrow_layer_platforms_for_modules_and_options() {
+        use serde_json::json;
+
+        let json = json!({
+            "schemaVersion": 1, "title": "Tools", "description": "Architecture-specific tools",
+            "layers": {"darwin": ["darwin"], "home": ["linux", "darwin"]},
+            "systems": ["aarch64-darwin", "x86_64-darwin"],
+            "options": [{"layer": "home", "path": ["example", "codex"], "type": "bool",
+                "title": "Codex", "description": "Restrict availability", "systems": ["aarch64-darwin"]}]
+        });
+        let manifest: Manifest = serde_json::from_value(json.clone()).unwrap();
+        manifest.validate().unwrap();
+        let option = &manifest.options[0];
+        let arm = Target::new(Platform::Darwin, "aarch64");
+        let intel = Target::new(Platform::Darwin, "x86_64");
+        assert!(manifest.option_available_on(option, &arm));
+        assert!(manifest.available_on(&intel));
+        assert!(!manifest.option_available_on(option, &intel));
+        assert!(!manifest.available_on(&Target::new(Platform::Linux, "aarch64")));
+
+        for systems in [
+            json!([]),
+            json!(["x86_64-bsd"]),
+            json!(["aarch64-darwin", "aarch64-darwin"]),
+        ] {
+            let mut invalid = json.clone();
+            invalid["systems"] = systems;
+            assert!(
+                serde_json::from_value::<Manifest>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let mut invalid = json;
+        invalid["options"][0]["systems"] = json!(["aarch64-linux"]);
+        assert!(
+            serde_json::from_value::<Manifest>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn string_choices_validate_type_values_and_defaults() {
+        let manifest_with_option = |kind, choices, default| {
+            serde_json::from_value::<Manifest>(serde_json::json!({
+                "schemaVersion": 1,
+                "title": "Example",
+                "description": "Example themes",
+                "layers": {"home": ["linux"]},
+                "options": [{"layer": "home", "path": ["appearance", "theme"],
+                    "title": "Theme", "description": "Color scheme", "type": kind,
+                    "choices": choices, "default": default}]
+            }))
+        };
+        use serde_json::json;
+        let manifest =
+            manifest_with_option("string", json!(["nord", "light", ""]), json!("nord")).unwrap();
+        manifest.validate().unwrap();
+        let option = &manifest.options[0];
+        assert!(option.accepts(&json!("")));
+        assert!(option.accepts(&json!("light")));
+        assert!(!option.accepts(&json!("Light")));
+        assert!(!option.accepts(&json!(false)));
+        for (kind, choices, default) in [
+            ("string", json!([]), json!("dark")),
+            ("string", json!(["dark", "dark"]), json!("dark")),
+            ("string", json!(["dark", "bad\u{001b}value"]), json!("dark")),
+            ("string", json!(["light"]), json!("dark")),
+            ("bool", json!(["light"]), json!(true)),
+        ] {
+            assert!(
+                manifest_with_option(kind, choices, default)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        assert!(manifest_with_option("string", json!(null), json!("dark")).is_err());
+        assert!(manifest_with_option("string", json!(["dark", 42]), json!("dark")).is_err());
     }
 
     #[test]
