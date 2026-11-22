@@ -58,15 +58,20 @@
             "uniqueItems": true,
             "items": {"type": "string", "not": {"pattern": "[\u0000-\u001f\u007f-\u009f]"}}
           },
-          "default": {}
+          "default": {},
+          "defaultsByPlatform": {
+            "description": "Значения по умолчанию для отдельных платформ. Если ключ отсутствует, используется default.",
+            "type": "object",
+            "propertyNames": {"enum": ["linux", "darwin"]}
+          }
         },
         "allOf": [
           {"if": {"required": ["choices"]}, "then": {"properties": {"type": {"const": "string"}}}},
-          {"if": {"properties": {"type": {"const": "bool"}}}, "then": {"properties": {"default": {"type": "boolean"}}}},
-          {"if": {"properties": {"type": {"const": "integer"}}}, "then": {"properties": {"default": {"type": "integer"}}}},
-          {"if": {"properties": {"type": {"const": "string"}}}, "then": {"properties": {"default": {"type": "string"}}}},
-          {"if": {"properties": {"type": {"const": "string_list"}}}, "then": {"properties": {"default": {"type": "array", "items": {"type": "string"}}}}},
-          {"if": {"properties": {"type": {"const": "packages"}}}, "then": {"properties": {"default": {"type": "array", "items": {"type": "string", "pattern": "^[-_+A-Za-z0-9]+(\\.[-_+A-Za-z0-9]+)*$"}}}}}
+          {"if": {"properties": {"type": {"const": "bool"}}}, "then": {"properties": {"default": {"type": "boolean"}, "defaultsByPlatform": {"additionalProperties": {"type": "boolean"}}}}},
+          {"if": {"properties": {"type": {"const": "integer"}}}, "then": {"properties": {"default": {"type": "integer"}, "defaultsByPlatform": {"additionalProperties": {"type": "integer"}}}}},
+          {"if": {"properties": {"type": {"const": "string"}}}, "then": {"properties": {"default": {"type": "string"}, "defaultsByPlatform": {"additionalProperties": {"type": "string"}}}}},
+          {"if": {"properties": {"type": {"const": "string_list"}}}, "then": {"properties": {"default": {"type": "array", "items": {"type": "string"}}, "defaultsByPlatform": {"additionalProperties": {"type": "array", "items": {"type": "string"}}}}}},
+          {"if": {"properties": {"type": {"const": "packages"}}}, "then": {"properties": {"default": {"type": "array", "items": {"type": "string", "pattern": "^[-_+A-Za-z0-9]+(\\.[-_+A-Za-z0-9]+)*$"}}, "defaultsByPlatform": {"additionalProperties": {"type": "array", "items": {"type": "string", "pattern": "^[-_+A-Za-z0-9]+(\\.[-_+A-Za-z0-9]+)*$"}}}}}}
         ]
       }
     }

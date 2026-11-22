@@ -110,6 +110,12 @@ pub struct ManifestOption {
     pub choices: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
+    #[serde(
+        default,
+        rename = "defaultsByPlatform",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub defaults_by_platform: BTreeMap<Platform, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,6 +168,12 @@ fn deserialize_string_list<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ManifestOption {
+    pub fn default_for(&self, platform: Platform) -> Option<&Value> {
+        self.defaults_by_platform
+            .get(&platform)
+            .or(self.default.as_ref())
+    }
+
     pub fn accepts(&self, value: &Value) -> bool {
         self.kind.accepts(value)
             && self.choices.as_ref().is_none_or(|choices| {
@@ -253,11 +265,11 @@ impl Manifest {
             {
                 return Err(format!("Неверные платформы параметра {:?}", option.path));
             }
+            let platforms = option
+                .platforms
+                .as_ref()
+                .unwrap_or(&self.layers[&option.layer]);
             if let Some(systems) = &option.systems {
-                let platforms = option
-                    .platforms
-                    .as_ref()
-                    .unwrap_or(&self.layers[&option.layer]);
                 validate_systems(systems, |platform| platforms.contains(&platform))
                     .map_err(|error| format!("{}: {:?}", error, option.path))?;
                 if self.systems.as_ref().is_some_and(|module_systems| {
@@ -296,6 +308,14 @@ impl Manifest {
                     "Недопустимое значение по умолчанию для параметра {:?}",
                     option.path
                 ));
+            }
+            for (platform, value) in &option.defaults_by_platform {
+                if !platforms.contains(platform) || !option.accepts(value) || !safe_default(value) {
+                    return Err(format!(
+                        "Недопустимое значение defaultsByPlatform для параметра {:?} на {platform:?}",
+                        option.path
+                    ));
+                }
             }
         }
         let mut paths = paths.iter();
@@ -1383,6 +1403,81 @@ mod tests {
         }
         assert!(manifest_with_option("string", json!(null), json!("dark")).is_err());
         assert!(manifest_with_option("string", json!(["dark", 42]), json!("dark")).is_err());
+    }
+
+    #[test]
+    fn validates_defaults_by_platform_and_keeps_general_defaults() {
+        use serde_json::json;
+
+        let metadata = json!({
+            "schemaVersion": 1,
+            "title": "Graphics",
+            "description": "Graphics tools",
+            "layers": {"home": ["linux", "darwin"]},
+            "options": [{
+                "layer": "home", "path": ["components", "graphics", "enabledPackages", "gimp3"],
+                "type": "bool", "title": "GIMP", "description": "Image editor",
+                "default": true, "defaultsByPlatform": {"darwin": false}
+            }]
+        });
+        let manifest: Manifest = serde_json::from_value(metadata.clone()).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest.options[0].default_for(Platform::Linux),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            manifest.options[0].default_for(Platform::Darwin),
+            Some(&json!(false))
+        );
+
+        let mut legacy = metadata.clone();
+        legacy["options"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("defaultsByPlatform");
+        let manifest: Manifest = serde_json::from_value(legacy).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest.options[0].default_for(Platform::Darwin),
+            Some(&json!(true))
+        );
+
+        for invalid in [json!(null), json!({"macos": false})] {
+            let mut invalid_manifest = metadata.clone();
+            invalid_manifest["options"][0]["defaultsByPlatform"] = invalid;
+            assert!(serde_json::from_value::<Manifest>(invalid_manifest).is_err());
+        }
+        let mut wrong_type = metadata.clone();
+        wrong_type["options"][0]["defaultsByPlatform"]["darwin"] = json!("off");
+        assert!(
+            serde_json::from_value::<Manifest>(wrong_type)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+
+        let mut wrong_scope = metadata.clone();
+        wrong_scope["options"][0]["platforms"] = json!(["linux"]);
+        assert!(
+            serde_json::from_value::<Manifest>(wrong_scope)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+
+        let mut wrong_choice = metadata;
+        let option = &mut wrong_choice["options"][0];
+        option["type"] = json!("string");
+        option["default"] = json!("light");
+        option["choices"] = json!(["light", "dark"]);
+        option["defaultsByPlatform"]["darwin"] = json!("missing");
+        assert!(
+            serde_json::from_value::<Manifest>(wrong_choice)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

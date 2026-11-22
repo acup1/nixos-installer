@@ -981,7 +981,10 @@ impl Ui {
                     let targets = if active { &available } else { &members };
                     let title = &manifest.options[targets[0]].title;
                     rows.push(mark_parameter_availability(
-                        Row::note(format!("    {} {title}", switch_mark(module, targets))),
+                        Row::note(format!(
+                            "    {} {title}",
+                            switch_mark(module, targets, target.platform)
+                        )),
                         active,
                         &target,
                     ));
@@ -1244,18 +1247,8 @@ impl Ui {
                 state.plan = None;
             }
             Some(Control::ToggleParameter(row, parameters)) => {
-                let module = &mut state.modules[row];
-                let enabled = !parameters.iter().all(|&i| module.boolean(i) == Some(true));
-                for parameter in parameters {
-                    let option = &module.module.manifest.options[parameter];
-                    let key = option_key(option);
-                    // Returning to the default lets subsequent catalog updates take effect.
-                    if option.default.as_ref().and_then(Value::as_bool) == Some(enabled) {
-                        module.values.remove(&key);
-                    } else {
-                        module.values.insert(key, Value::Bool(enabled));
-                    }
-                }
+                let platform = target_platform(state.mode);
+                state.modules[row].toggle(&parameters, platform);
                 state.plan = None;
             }
             Some(Control::ResetParameter(row, parameter)) => {
@@ -1334,7 +1327,9 @@ impl Ui {
                     let cursor = current
                         .and_then(|current| values.iter().position(|value| value == current))
                         .map_or(0, |index| index + 1);
-                    let default = option.default.as_ref().and_then(Value::as_str);
+                    let default = option
+                        .default_for(target_platform(state.mode))
+                        .and_then(Value::as_str);
                     let mut choices = vec![Choice {
                         value: None,
                         label: default.map_or_else(
@@ -1592,7 +1587,7 @@ impl Ui {
                 module
                     .values
                     .get(&option_key(option))
-                    .or(option.default.as_ref())
+                    .or(option.default_for(target_platform(state.mode)))
                     .map(|value| option_text(option.kind, value))
                     .unwrap_or_default()
             }
@@ -2381,12 +2376,28 @@ pub fn option_key(option: &ManifestOption) -> String {
 }
 
 impl ModuleRow {
-    fn boolean(&self, index: usize) -> Option<bool> {
+    fn boolean(&self, index: usize, platform: Platform) -> Option<bool> {
         let option = &self.module.manifest.options[index];
         self.values
             .get(&option_key(option))
-            .or(option.default.as_ref())
+            .or(option.default_for(platform))
             .and_then(Value::as_bool)
+    }
+
+    fn toggle(&mut self, targets: &[usize], platform: Platform) {
+        let enabled = !targets
+            .iter()
+            .all(|&i| self.boolean(i, platform) == Some(true));
+        for &index in targets {
+            let option = &self.module.manifest.options[index];
+            let key = option_key(option);
+            // Omit overrides which match the current target's default.
+            if option.default_for(platform).and_then(Value::as_bool) == Some(enabled) {
+                self.values.remove(&key);
+            } else {
+                self.values.insert(key, Value::Bool(enabled));
+            }
+        }
     }
 }
 
@@ -2444,10 +2455,16 @@ fn available_members(
         .collect()
 }
 
-fn switch_mark(row: &ModuleRow, targets: &[usize]) -> &'static str {
-    if targets.iter().all(|&i| row.boolean(i) == Some(true)) {
+fn switch_mark(row: &ModuleRow, targets: &[usize], platform: Platform) -> &'static str {
+    if targets
+        .iter()
+        .all(|&i| row.boolean(i, platform) == Some(true))
+    {
         "[×]"
-    } else if targets.iter().all(|&i| row.boolean(i) == Some(false)) {
+    } else if targets
+        .iter()
+        .all(|&i| row.boolean(i, platform) == Some(false))
+    {
         "[ ]"
     } else {
         "[–]"
@@ -2469,7 +2486,7 @@ fn parameter_rows(index: usize, row: &ModuleRow, target: &Target) -> Vec<Row> {
             let title = &manifest.options[targets[0]].title;
             rows.push(mark_parameter_availability(
                 Row::action(
-                    format!("  {} {title}", switch_mark(row, &targets)),
+                    format!("  {} {title}", switch_mark(row, &targets, target.platform)),
                     Control::ToggleParameter(index, targets),
                 ),
                 active,
@@ -2493,7 +2510,7 @@ fn parameter_rows(index: usize, row: &ModuleRow, target: &Target) -> Vec<Row> {
             )
         } else if option.kind == OptionKind::Bool {
             Row::action(
-                format!("  {} {label}", switch_mark(row, &[i])),
+                format!("  {} {label}", switch_mark(row, &[i], target.platform)),
                 Control::ToggleParameter(index, vec![i]),
             )
         } else if option.choices.is_some() {
@@ -2502,17 +2519,20 @@ fn parameter_rows(index: usize, row: &ModuleRow, target: &Target) -> Vec<Row> {
                     choice_text(value.as_str().unwrap_or_default()).into()
                 }
                 Some(value) => format!("{} (unavailable value)", option_text(option.kind, value)),
-                None => option.default.as_ref().and_then(Value::as_str).map_or_else(
-                    || "Default".into(),
-                    |value| format!("{} (default)", choice_text(value)),
-                ),
+                None => option
+                    .default_for(target.platform)
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || "Default".into(),
+                        |value| format!("{} (default)", choice_text(value)),
+                    ),
             };
             Row::action(
                 format!("  {label:<16} {display}  ›"),
                 Control::ChooseParameter(index, i),
             )
         } else {
-            let display = match (saved, &option.default) {
+            let display = match (saved, option.default_for(target.platform)) {
                 (Some(v), _) => option_text(option.kind, v),
                 (None, Some(v)) => format!("{} (default)", option_text(option.kind, v)),
                 _ => "Default".into(),
@@ -2812,6 +2832,7 @@ mod tests {
                         kind: OptionKind::Integer,
                         choices: None,
                         default: Some(json!(5001)),
+                        defaults_by_platform: BTreeMap::new(),
                     }],
                 },
             },
@@ -3043,6 +3064,90 @@ mod tests {
         assert_eq!(state.modules[0].values["home.signal"], true);
         ui.event(&mut state, Event::Key(18));
         assert!(state.modules[0].values.is_empty());
+    }
+
+    #[test]
+    fn grouped_package_uses_target_defaults_to_display_toggle_and_reset() {
+        let json = json!({
+            "schemaVersion": 1, "title": "Graphics", "description": "Graphics tools",
+            "layers": {"home": ["linux", "darwin"], "darwin": ["darwin"]},
+            "options": [
+                {"layer": "home", "path": ["components", "graphics", "enabledPackages", "gimp3"],
+                 "type": "bool", "title": "GIMP", "description": "Default GIMP setting",
+                 "default": true, "defaultsByPlatform": {"darwin": false}},
+                {"layer": "darwin", "path": ["components", "graphics", "enabledPackages", "gimp3"],
+                 "type": "bool", "title": "GIMP", "description": "Darwin GIMP setting",
+                 "default": false}
+            ]
+        });
+        let module = ModuleRow {
+            repository: 0,
+            selected: true,
+            values: BTreeMap::new(),
+            module: CatalogModule {
+                path: "graphics".into(),
+                manifest: serde_json::from_value(json).unwrap(),
+            },
+        };
+
+        for (platform, initially_enabled, members) in [
+            (Platform::Linux, true, vec![0]),
+            (Platform::Darwin, false, vec![0, 1]),
+        ] {
+            let target = Target::new(platform, "aarch64");
+            let mut module = module.clone();
+            let rows = parameter_rows(0, &module, &target);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].text.trim(),
+                if initially_enabled {
+                    "[×] GIMP"
+                } else {
+                    "[ ] GIMP"
+                }
+            );
+            assert!(
+                matches!(&rows[0].control, Some(Control::ToggleParameter(0, options)) if options == &members)
+            );
+            module.toggle(&members, platform);
+            assert_eq!(module.values.len(), members.len());
+            assert_eq!(
+                module.values["home.components.graphics.enabledPackages.gimp3"],
+                !initially_enabled
+            );
+            assert_eq!(
+                parameter_rows(0, &module, &target)[0].text.trim(),
+                if initially_enabled {
+                    "[ ] GIMP"
+                } else {
+                    "[×] GIMP"
+                }
+            );
+            module.toggle(&members, platform);
+            assert!(module.values.is_empty());
+        }
+
+        let mut state = session();
+        let target = state.target();
+        state.modules.push(module);
+        let mut ui = Ui {
+            page: 1,
+            ..Ui::default()
+        };
+        ui.focus = ui
+            .rows(&state)
+            .iter()
+            .position(|row| row.text.contains("] GIMP"))
+            .unwrap();
+        let before = ui.rows(&state)[ui.focus].text.clone();
+        ui.event(&mut state, Event::Key(13));
+        assert!(!state.modules[0].values.is_empty());
+        ui.event(&mut state, Event::Key(18));
+        assert!(state.modules[0].values.is_empty());
+        assert_eq!(
+            parameter_rows(0, &state.modules[0], &target)[0].text,
+            before
+        );
     }
 
     #[test]
