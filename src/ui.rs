@@ -4,6 +4,7 @@ use crate::catalog::{
 use crate::install::{
     BlockDevice, BootMode, DiskLayout, FileSystem, InstallPlan, InstallRequest, confirmation_token,
 };
+use crate::read_command::Cancellation;
 use serde_json::Value;
 use std::{collections::BTreeMap, env, fs, io, os::unix::fs::PermissionsExt, path::PathBuf};
 use terminalib::{
@@ -26,6 +27,7 @@ pub struct ModuleRow {
     pub values: BTreeMap<String, Value>,
 }
 
+#[derive(Clone)]
 pub struct Session {
     pub mode: Mode,
     pub repositories: Vec<SourceSpec>,
@@ -36,7 +38,7 @@ pub struct Session {
     pub install: InstallRequest,
     pub disks: Vec<BlockDevice>,
     pub plan: Option<InstallPlan>,
-    pub message: Option<(String, bool)>,
+    pub catalog_warning: Option<String>,
 }
 
 impl Session {
@@ -57,7 +59,7 @@ impl Session {
             install,
             disks: Vec::new(),
             plan: None,
-            message: None,
+            catalog_warning: None,
         }
     }
 
@@ -72,6 +74,7 @@ impl Session {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    LoadCatalog,
     RefreshCatalog,
     RefreshDisks,
     EditPartitions(String),
@@ -287,6 +290,7 @@ struct Ui {
     applied: bool,
     catalog_dirty: bool,
     calamares: bool,
+    loading: bool,
     nav_hits: Vec<(Area, usize)>,
     exit_hit: Option<Area>,
     accept_hit: Option<Area>,
@@ -309,36 +313,103 @@ enum Outcome {
     Execute(Action),
 }
 
-pub fn run(
-    state: &mut Session,
-    mut handle: impl FnMut(Action, &mut Session) -> Result<String, String>,
+type ActionHandler<T> = fn(&mut T, Action, &mut Session) -> Result<String, String>;
+
+struct CatalogJob<T> {
+    receiver: std::sync::mpsc::Receiver<(T, Session, Result<String, String>)>,
+    stop: Cancellation,
+}
+
+impl<T: Send + 'static> CatalogJob<T> {
+    fn start(
+        mut controller: T,
+        mut session: Session,
+        action: Action,
+        handle: ActionHandler<T>,
+    ) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let stop = Cancellation::default();
+        let cancellation = stop.clone();
+        std::thread::spawn(move || {
+            let allow_network =
+                session.mode == Mode::Install || matches!(action, Action::RefreshCatalog);
+            let result = cancellation.scope(allow_network, || {
+                handle(&mut controller, action, &mut session)
+            });
+            let _ = sender.send((controller, session, result));
+        });
+        Self { receiver, stop }
+    }
+}
+
+impl<T> Drop for CatalogJob<T> {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+pub fn run<T: Send + 'static>(
+    mut state: Session,
+    controller: T,
+    handle: ActionHandler<T>,
 ) -> Result<(), String> {
+    use std::sync::mpsc::TryRecvError;
+
     let error = |err: io::Error| format!("Terminal error: {err}");
     let mut terminal = open_terminal().map_err(error)?;
     let mut frame = FrameBuffer::default();
-    let message = state.message.take();
-    let modal = message
-        .as_ref()
-        .filter(|(_, success)| !*success)
-        .map(|(text, _)| Modal::Notice {
-            title: "Catalog unavailable",
-            text: text.clone(),
-            offset: 0,
-        });
     let mut ui = Ui {
-        message,
-        modal,
+        loading: true,
         calamares: state.mode == Mode::Install && executable_in_path("calamares"),
         ..Ui::default()
     };
+    let mut controller = Some(controller);
+    let mut job = None::<CatalogJob<T>>;
     let mut redraw = true;
     loop {
+        if let Some(active) = &job {
+            match active.receiver.try_recv() {
+                Ok((returned, updated, result)) => {
+                    controller = Some(returned);
+                    job = None;
+                    ui.loading = false;
+                    match result {
+                        Ok(message) => {
+                            state = updated;
+                            ui.catalog_dirty = state.catalog_warning.is_some();
+                            if let Some(warning) = &state.catalog_warning {
+                                ui.failure("Catalog incomplete", warning.clone());
+                            } else {
+                                ui.message = Some((message, true));
+                            }
+                        }
+                        Err(message) => {
+                            ui.catalog_dirty = true;
+                            ui.failure("Catalog unavailable", message);
+                        }
+                    }
+                    redraw = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err("The catalog worker stopped unexpectedly.".into());
+                }
+            }
+        }
         let (height, width) = terminal.getsize();
         if redraw || height != frame.height() || width != frame.width() {
             frame.resize(width, height);
-            ui.render(&mut frame, state);
+            ui.render(&mut frame, &state);
             frame.present(&mut terminal.stdout).map_err(error)?;
             redraw = false;
+        }
+        if ui.loading && job.is_none() {
+            job = Some(CatalogJob::start(
+                controller.take().expect("idle controller"),
+                state.clone(),
+                Action::LoadCatalog,
+                handle,
+            ));
         }
         let event = match read_event(&mut terminal) {
             Ok(Event::Idle) => continue,
@@ -347,9 +418,18 @@ pub fn run(
             Err(err) => return Err(error(err)),
         };
         redraw = true;
-        match ui.event(state, event) {
+        match ui.event(&mut state, event) {
             Outcome::Continue => {}
             Outcome::Quit => return terminal.restore().map_err(error),
+            Outcome::Execute(Action::RefreshCatalog) => {
+                ui.loading = true;
+                job = Some(CatalogJob::start(
+                    controller.take().expect("idle controller"),
+                    state.clone(),
+                    Action::RefreshCatalog,
+                    handle,
+                ));
+            }
             Outcome::Execute(action) => {
                 terminal.restore().map_err(error)?;
                 drop(terminal);
@@ -361,23 +441,20 @@ pub fn run(
                 }
                 let applied = matches!(action, Action::ApplyInstall);
                 let review = matches!(action, Action::ReviewInstall);
-                let refresh = matches!(action, Action::RefreshCatalog);
-                match handle(action, state) {
+                match handle(
+                    controller.as_mut().expect("idle controller"),
+                    action,
+                    &mut state,
+                ) {
                     Ok(message) => {
                         ui.applied |= applied;
-                        ui.catalog_dirty &= !refresh;
                         ui.message = Some((message, true));
                     }
                     Err(message) => {
                         if review || applied {
                             state.plan = None;
                         }
-                        ui.modal = Some(Modal::Notice {
-                            title: "Action failed",
-                            text: message.clone(),
-                            offset: 0,
-                        });
-                        ui.message = Some((message, false));
+                        ui.failure("Action failed", message);
                     }
                 }
                 terminal = open_terminal().map_err(error)?;
@@ -561,7 +638,11 @@ impl Ui {
                 let query = self.search.to_lowercase();
                 let mut found = false;
                 let platform = target_platform(state.mode);
-                if self.catalog_dirty {
+                if state.catalog_warning.is_some() {
+                    rows.push(Row::note(
+                        "Some module sources are unavailable. Refresh before applying changes.",
+                    ));
+                } else if self.catalog_dirty {
                     rows.push(Row::note(
                         "Sources changed. Reload the catalog before applying changes.",
                     ));
@@ -879,7 +960,30 @@ impl Ui {
         self.offset = 0;
     }
 
+    fn failure(&mut self, title: &'static str, message: String) {
+        self.modal = Some(Modal::Notice {
+            title,
+            text: message.clone(),
+            offset: 0,
+        });
+        self.message = Some((message, false));
+    }
+
     fn event(&mut self, state: &mut Session, event: Event) -> Outcome {
+        if self.loading {
+            return match event {
+                Event::Key(27) => Outcome::Quit,
+                Event::Mouse(mouse)
+                    if mouse.event == MouseEvent::LEFT
+                        && self
+                            .exit_hit
+                            .is_some_and(|area| area.contains(mouse.x, mouse.y)) =>
+                {
+                    Outcome::Quit
+                }
+                _ => Outcome::Continue,
+            };
+        }
         if let Some(modal) = self.modal.take() {
             return self.modal_event(state, modal, event);
         }
@@ -1737,7 +1841,9 @@ impl Ui {
             ));
         }
         self.exit_hit = Some(button(frame, nav_y, width / 2 - 5, " Esc  Exit "));
-        let bottom = if let Some((message, success)) = &self.message {
+        let bottom = if self.loading {
+            ("Loading module sources…   Esc Exit".into(), BLUE)
+        } else if let Some((message, success)) = &self.message {
             (
                 format!(
                     "{} {}",

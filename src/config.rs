@@ -331,6 +331,12 @@ fn render(path: &Path, record: &Record) -> Result<String> {
     ))
 }
 
+#[derive(Default, Deserialize)]
+pub struct CatalogContext {
+    pub originals: Vec<String>,
+    pub sources: Vec<String>,
+}
+
 pub struct Selector {
     path: PathBuf,
     file: FileState,
@@ -482,8 +488,9 @@ impl Selector {
 
     pub fn flake_dir(&self) -> Result<Option<String>> {
         let path = self.path.to_str().ok_or("Selector path must be UTF-8")?;
-        nix_json(
+        nix_json_with_network(
             &self.path,
+            false,
             &format!(
                 "let cfg = import (builtins.toPath {}) {{ inputs = {{}}; }}; in if (cfg.flakeDir or null) == null then null else toString cfg.flakeDir",
                 quote(path),
@@ -491,29 +498,64 @@ impl Selector {
         )
     }
 
-    pub fn original_paths(&self, host: &str) -> Result<Vec<String>> {
+    pub fn catalog_context(&self, host: &str, offline: bool) -> Result<CatalogContext> {
         let original = if self.backup.is_some() {
             backup_path(&self.path)
-        } else if self.record.is_some() {
-            return Ok(Vec::new());
         } else {
             self.path.clone()
         };
         let host = flake_reference(host);
-        let inputs = if host.is_empty() {
-            "{}".into()
-        } else {
-            let host = nix_flake_reference(host);
-            format!(
-                r#"(let flake = builtins.getFlake {}; in flake.inputs // {{ self = flake; }})"#,
-                quote(&host)
-            )
-        };
+        if host.trim().is_empty() || host.starts_with('-') {
+            return Err("Set flakeDir in config.nix or enter a host flake override.".into());
+        }
+        let definition = Path::new(host).join("flake.nix");
+        let local = Path::new(host).is_absolute() || host.starts_with('.');
+        if local && !definition.is_file() {
+            return Err(format!("Host flake is missing: {}", definition.display()));
+        }
+        let host = nix_flake_reference(host);
+        let inputs = format!(
+            "(let flake = builtins.getFlake {}; in flake.inputs // {{ self = flake; }})",
+            quote(&host)
+        );
         let path = original.to_str().ok_or("Selector path must be UTF-8")?;
-        nix_json(
+        let modules = if self.managed() && self.backup.is_none() {
+            // The installer generated this list from saved choices. Forcing it
+            // here can fetch every pinned source and is unnecessary to load metadata.
+            "[]"
+        } else {
+            "(cfg.modules or null)"
+        };
+        let valid_host = if local {
+            let definition = definition.to_str().ok_or("Host flake path must be UTF-8")?;
+            format!(
+                "builtins.isFunction ((import (builtins.toPath {})).outputs or null)",
+                quote(definition)
+            )
+        } else {
+            // Loading a remote host's outputs is deferred until Rebuild.
+            "true".into()
+        };
+        nix_json_with_network(
             &self.path,
+            !offline,
             &format!(
-                "let cfg = import (builtins.toPath {}) {{ inputs = {inputs}; }};\n pathOf = {PATH_OF};\n in builtins.filter (path: path != null) (map pathOf (cfg.modules or []))",
+                r#"let
+                    cfg = import (builtins.toPath {}) {{ inputs = {inputs}; }};
+                    pathOf = {PATH_OF};
+                    modules = {modules};
+                    sources = cfg.moduleSources or [];
+                    in if !({valid_host}) then throw "The host flake must define an outputs function"
+                    else if !(builtins.isList modules && builtins.all builtins.isAttrs modules)
+                    then throw "config.nix must declare modules as a list of module bundles"
+                    else if !(builtins.isList sources && builtins.all
+                      (source: (builtins.isString source || builtins.isPath source)
+                        && builtins.substring 0 1 (toString source) == "/") sources)
+                    then throw "moduleSources must be a list of absolute catalog paths"
+                    else {{
+                      originals = builtins.filter (path: path != null) (map pathOf modules);
+                      sources = map toString sources;
+                    }}"#,
                 quote(path),
             ),
         )
@@ -711,15 +753,28 @@ pub fn manual_changes(changes: &[(&str, &Choice)]) -> Result<String> {
     Ok(out)
 }
 
-pub fn remote_root(selector: &Path, location: &Location) -> Result<String> {
-    nix_json(
+pub fn remote_root(selector: &Path, location: &Location, offline: bool) -> Result<String> {
+    nix_json_with_network(
         selector,
+        !offline,
         &format!("toString ({})", repository_expression(location)?),
     )
 }
 
 fn nix_json<T: for<'de> Deserialize<'de>>(selector: &Path, expression: &str) -> Result<T> {
-    let output = Command::new("nix")
+    nix_json_with_network(selector, true, expression)
+}
+
+fn nix_json_with_network<T: for<'de> Deserialize<'de>>(
+    selector: &Path,
+    allow_network: bool,
+    expression: &str,
+) -> Result<T> {
+    let mut command = Command::new("nix");
+    if !allow_network {
+        command.arg("--offline");
+    }
+    command
         .args([
             "--extra-experimental-features",
             "nix-command flakes",
@@ -733,8 +788,8 @@ fn nix_json<T: for<'de> Deserialize<'de>>(selector: &Path, expression: &str) -> 
             "--expr",
             expression,
         ])
-        .env("NIXOS_BASE_CONFIG", selector)
-        .output()
+        .env("NIXOS_BASE_CONFIG", selector);
+    let output = crate::read_command::output(&mut command)
         .map_err(|error| format!("Inspecting selector with nix: {error}"))?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr);
@@ -858,20 +913,11 @@ impl RebuildTarget {
         Self::resolve_for(flake, selector, HostPlatform::current())
     }
 
-    pub fn validate_selector(flake: &str, selector: &Path) -> Result<()> {
-        Self::inspect(flake, selector, HostPlatform::current(), true).map(|_| ())
-    }
-
     fn resolve_for(flake: &str, selector: &Path, platform: HostPlatform) -> Result<Self> {
-        Self::inspect(flake, selector, platform, false)
+        Self::inspect(flake, selector, platform)
     }
 
-    fn inspect(
-        flake: &str,
-        selector: &Path,
-        platform: HostPlatform,
-        validate_modules: bool,
-    ) -> Result<Self> {
+    fn inspect(flake: &str, selector: &Path, platform: HostPlatform) -> Result<Self> {
         let (reference, explicit) = flake
             .split_once('#')
             .map_or((flake, None), |(reference, name)| (reference, Some(name)));
@@ -881,15 +927,10 @@ impl RebuildTarget {
         let reference = nix_flake_reference(reference);
         let path = selector.to_str().ok_or("Selector path must be UTF-8")?;
         let outputs = platform.outputs();
-        let modules_check = if validate_modules {
-            r#"if !(builtins.isList (cfg.modules or null) && builtins.all builtins.isAttrs cfg.modules) then throw "config.nix must declare modules as a list of module bundles" else "#
-        } else {
-            ""
-        };
         let data: FlakeOutputs = nix_json(
             selector,
             &format!(
-                "let flake = builtins.getFlake {}; cfg = import (builtins.toPath {}) {{ inputs = flake.inputs // {{ self = flake; }}; }}; in {modules_check}{{ names = builtins.attrNames (flake.{outputs} or {{}}); username = cfg.username or null; hostname = cfg.hostName or null; }}",
+                "let flake = builtins.getFlake {}; cfg = import (builtins.toPath {}) {{ inputs = flake.inputs // {{ self = flake; }}; }}; in {{ names = builtins.attrNames (flake.{outputs} or {{}}); username = cfg.username or null; hostname = cfg.hostName or null; }}",
                 quote(&reference),
                 quote(path),
             ),
@@ -1212,9 +1253,11 @@ mod selector_tests {
         let fixture = Fixture::new();
         let config = fixture.0.join("config.nix");
         fs::write(&config, ORIGINAL).unwrap();
+        fs::write(fixture.0.join("flake.nix"), "{ outputs = inputs: {}; }").unwrap();
+        let host = fixture.0.to_str().unwrap();
         let old = Selector::read(&config).unwrap().unwrap();
         assert_eq!(
-            old.original_paths("").unwrap(),
+            old.catalog_context(host, true).unwrap().originals,
             ["/catalog/first", "/catalog/second"]
         );
 
@@ -1233,7 +1276,7 @@ mod selector_tests {
         let managed = configure(&config, &old, masks.clone(), &changes);
         assert_eq!(managed.masked(), masks);
         assert_eq!(
-            managed.original_paths("").unwrap(),
+            managed.catalog_context(host, true).unwrap().originals,
             ["/catalog/first", "/catalog/second"]
         );
         let again = configure(&config, &managed, managed.masked(), &changes);

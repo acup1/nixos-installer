@@ -384,14 +384,47 @@ where
         ])
         .args(arguments);
 
-    let output = command
-        .output()
-        .map_err(|error| format!("Не удалось запустить Git: {error}"))?;
+    let mut output = crate::read_command::output(&mut command);
+    if output
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        output = crate::read_command::output(&mut git_shell(&command));
+    }
+    let output = output.map_err(|error| format!("Не удалось запустить Git: {error}"))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Git завершился с ошибкой: {}", detail.trim()));
     }
     String::from_utf8(output.stdout).map_err(|_| "Git вернул данные вне UTF-8".into())
+}
+
+fn git_shell(git: &Command) -> Command {
+    let package = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "github:NixOS/nixpkgs/nixpkgs-26.05-darwin#git"
+    } else {
+        "github:NixOS/nixpkgs/nixos-unstable#git"
+    };
+    let mut shell = Command::new("nix");
+    if !crate::read_command::network_allowed() {
+        shell.arg("--offline");
+    }
+    shell.args([
+        "--extra-experimental-features",
+        "nix-command flakes",
+        "shell",
+        package,
+        "--command",
+        "git",
+    ]);
+    shell.args(git.get_args());
+    for (key, value) in git.get_envs() {
+        match value {
+            Some(value) => shell.env(key, value),
+            None => shell.env_remove(key),
+        };
+    }
+    shell
 }
 
 fn is_commit_id(reference: &str) -> bool {
@@ -579,19 +612,54 @@ fn cached_checkout(
     selector: &str,
     repository: &str,
     local_revision: Option<&str>,
+    allow_fetch: bool,
 ) -> Result<(PathBuf, String), String> {
     fs::create_dir_all(cache).map_err(|error| format!("{}: {error}", cache.display()))?;
     ensure_directory(cache)?;
     let cache = cache
         .canonicalize()
         .map_err(|error| format!("{}: {error}", cache.display()))?;
-    let entry = cache.join(cache_id(spec, local_revision));
+    let expected = cache.join(cache_id(spec, local_revision));
+    // Older selectors may save a branch's resolved commit while the cache
+    // still uses the branch key. Reuse it only when origin and commit agree.
+    let entry = if !expected.exists() && local_revision.is_none() && is_commit_id(selector) {
+        fs::read_dir(&cache)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| {
+                        name.len() == 16 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
+            .filter(|entry| fs::symlink_metadata(entry).is_ok_and(|metadata| metadata.is_dir()))
+            .find(|entry| {
+                read_json::<CacheRecord>(&entry.join("source.json")).is_ok_and(|record| {
+                    record.spec.repository == spec.repository
+                        && record.spec.mode == spec.mode
+                        && record.revision == selector
+                })
+            })
+            .unwrap_or(expected)
+    } else {
+        expected
+    };
     let exists = match entry.symlink_metadata() {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(format!("{}: {error}", entry.display())),
     };
     if !exists {
+        if !allow_fetch {
+            return Err(format!(
+                "{} at {} is not cached. Choose Refresh catalog to fetch it.",
+                spec.repository, spec.reference
+            ));
+        }
         let sequence = NEXT_CHECKOUT.fetch_add(1, Ordering::Relaxed);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -621,7 +689,11 @@ fn cached_checkout(
     }
     ensure_directory(&entry)?;
     let record: CacheRecord = read_json(&entry.join("source.json"))?;
-    if &record.spec != spec || !is_commit_id(&record.revision) {
+    let matching_pin = is_commit_id(selector)
+        && record.revision == selector
+        && record.spec.repository == spec.repository
+        && record.spec.mode == spec.mode;
+    if (&record.spec != spec && !matching_pin) || !is_commit_id(&record.revision) {
         return Err(format!("Запись кеша повреждена: {}", entry.display()));
     }
     let checkout = entry.join("checkout");
@@ -683,11 +755,49 @@ pub fn discover_updated(spec: &SourceSpec, cache: &Path) -> Result<CatalogSource
 }
 
 pub fn discover(spec: &SourceSpec, cache: &Path) -> Result<CatalogSource, String> {
+    discover_with_network(spec, cache, true)
+}
+
+pub fn discover_cached(spec: &SourceSpec, cache: &Path) -> Result<CatalogSource, String> {
+    discover_with_network(spec, cache, false)
+}
+
+fn discover_with_network(
+    spec: &SourceSpec,
+    cache: &Path,
+    allow_fetch: bool,
+) -> Result<CatalogSource, String> {
     let mut spec = spec.clone();
+    let candidate = Path::new(&spec.repository);
+    if candidate.is_absolute() && !candidate.exists() {
+        return Err(format!(
+            "Catalog directory is missing: {}",
+            candidate.display()
+        ));
+    }
+    if candidate.exists() && spec.mode == SourceMode::Local && !candidate.join(".git").exists() {
+        if !matches!(spec.reference.as_str(), "" | "HEAD") {
+            return Err(format!(
+                "A plain catalog directory has no Git references: {}",
+                candidate.display()
+            ));
+        }
+        let checkout = candidate
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", candidate.display()))?;
+        spec.repository = checkout
+            .to_str()
+            .ok_or("Catalog path must be UTF-8")?
+            .into();
+        return Ok(CatalogSource {
+            spec,
+            modules: read_checkout(&checkout)?,
+            checkout,
+            revision: None,
+        });
+    }
     let current = std::env::current_dir().map_err(|error| error.to_string())?;
     let selector = reference_selector(&spec.reference, &current)?;
-    let candidate = Path::new(&spec.repository);
-
     let (checkout, revision) = if candidate.exists() {
         if spec.mode == SourceMode::Pinned {
             return Err("Для закреплённого источника необходим удалённый URL Git".into());
@@ -703,11 +813,18 @@ pub fn discover(spec: &SourceSpec, cache: &Path) -> Result<CatalogSource, String
         if selector == "HEAD" || head.trim() == selector {
             (checkout, revision)
         } else {
-            cached_checkout(&spec, cache, &revision, &spec.repository, Some(&revision))?
+            cached_checkout(
+                &spec,
+                cache,
+                &revision,
+                &spec.repository,
+                Some(&revision),
+                true,
+            )?
         }
     } else {
         spec.repository = remote_url(&spec.repository)?;
-        cached_checkout(&spec, cache, &selector, &spec.repository, None)?
+        cached_checkout(&spec, cache, &selector, &spec.repository, None, allow_fetch)?
     };
 
     let modules = read_checkout(&checkout)?;
@@ -887,7 +1004,8 @@ mod tests {
                 &cache,
                 "refs/heads/missing",
                 transport,
-                Some(&revision)
+                Some(&revision),
+                true
             )
             .is_err()
         );
@@ -895,10 +1013,12 @@ mod tests {
 
         // Exercise the same checkout flow without a network dependency.
         let (checkout, pinned) =
-            cached_checkout(&spec, &cache, &revision, transport, Some(&revision)).unwrap();
+            cached_checkout(&spec, &cache, &revision, transport, Some(&revision), true).unwrap();
         assert_eq!(pinned, revision);
         write_module(&checkout, "dirty", MANIFEST);
-        assert!(cached_checkout(&spec, &cache, &revision, transport, Some(&revision)).is_err());
+        assert!(
+            cached_checkout(&spec, &cache, &revision, transport, Some(&revision), true).is_err()
+        );
 
         let mut unsupported = local_source(&repository, "HEAD");
         unsupported.mode = SourceMode::Pinned;
@@ -979,5 +1099,18 @@ mod tests {
         fs::remove_file(&manifest).unwrap();
         symlink(fixture.0.join("outside/module.json"), &manifest).unwrap();
         assert!(read_checkout(&repository).is_err());
+    }
+    #[test]
+    fn cold_configure_does_not_fetch_a_remote_catalog() {
+        let fixture = Fixture::new();
+        let cache = fixture.0.join("cache");
+        let source = SourceSpec {
+            repository: "https://no-network.invalid/catalog.git".into(),
+            reference: "1234567890123456789012345678901234567890".into(),
+            mode: SourceMode::Pinned,
+        };
+        let error = discover_cached(&source, &cache).unwrap_err();
+        assert!(error.contains("is not cached"));
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
     }
 }

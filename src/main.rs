@@ -1,6 +1,7 @@
 mod catalog;
 mod config;
 mod install;
+mod read_command;
 mod ui;
 
 use catalog::{CatalogSource, Layer, OptionKind, Platform, SourceMode, SourceSpec};
@@ -70,6 +71,7 @@ struct Controller {
     selector: Option<Selector>,
     inspected_host: String,
     manual: BTreeMap<(usize, String), String>,
+    unavailable: Vec<String>,
 }
 impl Controller {
     fn selections(&self, state: &Session) -> Vec<Selected> {
@@ -89,7 +91,10 @@ impl Controller {
     fn refresh(&mut self, state: &mut Session, update: bool) -> Result<String> {
         let selector_path = Path::new(&state.selector);
         let selector = if state.mode == Mode::Configure {
-            Selector::read(selector_path)?
+            Some(
+                Selector::read(selector_path)?
+                    .ok_or_else(|| format!("Selector {} is missing.", selector_path.display()))?,
+            )
         } else {
             None
         };
@@ -120,7 +125,9 @@ impl Controller {
         } else {
             HashMap::new()
         };
-        let mut repositories = if !same_selector {
+        let mut repositories = if !same_selector
+            && (self.selector.is_some() || (!update && state.repositories.is_empty()))
+        {
             selector
                 .as_ref()
                 .and_then(Selector::repositories)
@@ -129,17 +136,13 @@ impl Controller {
         } else {
             state.repositories.clone()
         };
-        let originals = selector
+        let offline = state.mode == Mode::Configure && !update;
+        let context = selector
             .as_ref()
-            .map(|selector| selector.original_paths(state.host_flake()))
+            .map(|selector| selector.catalog_context(state.host_flake(), offline))
             .transpose()?
             .unwrap_or_default();
-        if selector
-            .as_ref()
-            .is_some_and(|selector| !selector.managed())
-        {
-            add_manual_sources(&originals, &mut repositories);
-        }
+        add_local_sources(&context.sources, &context.originals, &mut repositories);
         let persisted = selector
             .as_ref()
             .map(Selector::selections)
@@ -156,6 +159,7 @@ impl Controller {
 
         let mut sources = vec![];
         let mut rows = vec![];
+        let mut unavailable = vec![];
         let platform = if state.mode == Mode::Install || cfg!(target_os = "linux") {
             Platform::Linux
         } else {
@@ -166,18 +170,39 @@ impl Controller {
                 return Err(format!("Duplicate repository {}", spec.repository));
             }
             let cache = self.dir.join("repositories");
-            let source = if let Some(source) = selector
-                .as_ref()
-                .filter(|selector| selector.installed())
-                .map(|_| installed_local_checkout(spec, Path::new("/etc/nixos")))
-                .transpose()?
-                .flatten()
-            {
-                source
-            } else if update {
-                catalog::discover_updated(spec, &cache)?
-            } else {
-                catalog::discover(spec, &cache)?
+            let loaded = (|| {
+                if let Some(source) = selector
+                    .as_ref()
+                    .filter(|selector| selector.installed())
+                    .map(|_| installed_local_checkout(spec, Path::new("/etc/nixos")))
+                    .transpose()?
+                    .flatten()
+                {
+                    Ok(source)
+                } else if update {
+                    catalog::discover_updated(spec, &cache)
+                } else if offline {
+                    catalog::discover_cached(spec, &cache)
+                } else {
+                    catalog::discover(spec, &cache)
+                }
+            })();
+            let source = match loaded {
+                Ok(source) => source,
+                Err(error) => {
+                    unavailable.push(format!("{}: {error}", spec.repository));
+                    self.loaded
+                        .iter()
+                        .position(|old| old == spec)
+                        .and_then(|index| self.sources.get(index))
+                        .cloned()
+                        .unwrap_or_else(|| CatalogSource {
+                            spec: spec.clone(),
+                            checkout: PathBuf::new(),
+                            revision: None,
+                            modules: vec![],
+                        })
+                }
             };
             for module in source
                 .modules
@@ -194,7 +219,16 @@ impl Controller {
             sources.push(source);
         }
 
-        let manual = manual_matches(selector_path, &originals, &sources, &rows);
+        let manual = manual_matches(selector_path, &context.originals, &sources, &rows, offline);
+        if selector
+            .as_ref()
+            .is_some_and(|selector| !selector.current(selector_path))
+        {
+            return Err(
+                "The selector changed during catalog loading. Refresh to use its latest contents."
+                    .into(),
+            );
+        }
         for row in &mut rows {
             let spec = &repositories[row.repository];
             let path = &row.module.path;
@@ -220,6 +254,21 @@ impl Controller {
         self.selector = selector;
         self.inspected_host = config::flake_reference(state.host_flake()).to_owned();
         self.manual = manual;
+        state.catalog_warning = if unavailable.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Fix or remove unavailable sources on Module sources and refresh before saving.
+
+{}",
+                unavailable.join(
+                    "
+
+"
+                )
+            ))
+        };
+        self.unavailable = unavailable;
         state.modules = rows;
         state.plan = None;
         Ok(format!(
@@ -229,6 +278,11 @@ impl Controller {
         ))
     }
     fn choices(&self, state: &Session) -> Result<Vec<Choice>> {
+        if !self.unavailable.is_empty() {
+            return Err(
+                "Fix unavailable module sources and refresh before applying changes.".into(),
+            );
+        }
         if self.loaded != state.repositories {
             return Err("Refresh the catalog after changing repositories.".into());
         }
@@ -475,6 +529,12 @@ impl Controller {
             if source.spec.mode != SourceMode::Local || !choices.iter().any(|c| c.repo == i) {
                 continue;
             }
+            if source.revision.is_none() {
+                return Err(format!(
+                    "Select a clean Git checkout for installation. {} is a plain catalog directory and can be used in Configure.",
+                    source.checkout.display()
+                ));
+            }
             let output = Command::new("git")
                 .current_dir(&source.checkout)
                 .args(["status", "--porcelain"])
@@ -502,6 +562,7 @@ impl Controller {
                 state.plan = None;
                 Ok("Calamares closed".into())
             }
+            Action::LoadCatalog => self.refresh(state, false),
             Action::RefreshCatalog => self.refresh(state, true),
             Action::RefreshDisks => {
                 state.disks = install::probe()?;
@@ -571,14 +632,14 @@ fn remote_identity(url: &str) -> Option<String> {
 }
 
 fn git_output(directory: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .current_dir(directory)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .args(args)
-        .output()
-        .ok()?;
+        .args(args);
+    let output = read_command::output(&mut command).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -586,7 +647,8 @@ fn git_output(directory: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn checkout_origin(root: &Path) -> Option<(String, String)> {
-    if !git_output(root, &["rev-parse", "--show-prefix"])?.is_empty() {
+    if !root.join(".git").exists() || !git_output(root, &["rev-parse", "--show-prefix"])?.is_empty()
+    {
         return None;
     }
     let remote = git_output(root, &["remote", "get-url", "origin"])?;
@@ -596,48 +658,60 @@ fn checkout_origin(root: &Path) -> Option<(String, String)> {
     ))
 }
 
-fn add_manual_sources(originals: &[String], repositories: &mut Vec<SourceSpec>) {
-    let checkouts: BTreeSet<PathBuf> = originals
+fn add_local_sources(
+    explicit: &[String],
+    originals: &[String],
+    repositories: &mut Vec<SourceSpec>,
+) {
+    let mut registered: BTreeSet<PathBuf> = repositories
         .iter()
-        .filter_map(|original| {
-            let path = Path::new(original);
-            if !path.is_absolute() || path.starts_with("/nix/store") {
-                return None;
-            }
-            let directory = path.canonicalize().ok()?;
-            if !["default.nix", "module.json"].iter().all(|name| {
-                fs::symlink_metadata(directory.join(name)).is_ok_and(|file| file.is_file())
-            }) {
-                return None;
-            }
-            let root = PathBuf::from(git_output(&directory, &["rev-parse", "--show-toplevel"])?)
-                .canonicalize()
-                .ok()?;
-            let relative = directory.strip_prefix(&root).ok()?.to_str()?;
-            catalog::validate_module_path(relative).ok()?;
-            Some(root)
-        })
+        .filter(|source| source.mode == SourceMode::Local)
+        .filter_map(|source| Path::new(&source.repository).canonicalize().ok())
         .collect();
+    for repository in explicit {
+        let path = PathBuf::from(repository);
+        let identity = path.canonicalize().unwrap_or(path);
+        if registered.insert(identity) {
+            repositories.push(SourceSpec {
+                repository: repository.clone(),
+                reference: "HEAD".into(),
+                mode: SourceMode::Local,
+            });
+        }
+    }
 
-    for root in checkouts {
-        let existing = repositories.iter().any(|spec| {
-            if spec.mode != SourceMode::Local
-                || !Path::new(&spec.repository)
-                    .canonicalize()
-                    .is_ok_and(|path| path == root)
-            {
-                return false;
-            }
-            match spec.reference.as_str() {
-                "" | "HEAD" => true,
-                name => git_output(&root, &["symbolic-ref", "--quiet", "HEAD"])
-                    .as_deref()
-                    .is_some_and(|head| {
-                        head == name || head.strip_prefix("refs/heads/") == Some(name)
-                    }),
-            }
-        });
-        if !existing && let Some(repository) = root.to_str() {
+    for original in originals {
+        let path = Path::new(original);
+        if !path.is_absolute() || path.starts_with("/nix/store") {
+            continue;
+        }
+        let Ok(directory) = path.canonicalize() else {
+            continue;
+        };
+        if !["default.nix", "module.json"]
+            .iter()
+            .all(|name| fs::symlink_metadata(directory.join(name)).is_ok_and(|file| file.is_file()))
+            || registered
+                .iter()
+                .any(|root| root != &directory && directory.starts_with(root))
+        {
+            continue;
+        }
+        let Some(root) = directory
+            .ancestors()
+            .skip(1)
+            .find(|path| path.join(".git").exists())
+            .or_else(|| directory.parent())
+        else {
+            continue;
+        };
+        let Some(relative) = directory.strip_prefix(root).ok().and_then(Path::to_str) else {
+            continue;
+        };
+        if catalog::validate_module_path(relative).is_ok()
+            && let Some(repository) = root.to_str()
+            && registered.insert(root.to_path_buf())
+        {
             repositories.push(SourceSpec {
                 repository: repository.into(),
                 reference: "HEAD".into(),
@@ -652,6 +726,7 @@ fn manual_matches(
     originals: &[String],
     sources: &[CatalogSource],
     rows: &[ModuleRow],
+    offline: bool,
 ) -> BTreeMap<(usize, String), String> {
     let mut matches: BTreeMap<(usize, String), Vec<&String>> = BTreeMap::new();
     let mut origins = BTreeMap::new();
@@ -688,6 +763,7 @@ fn manual_matches(
                                 url: source.spec.repository.clone(),
                                 rev: revision.into(),
                             },
+                            offline,
                         )
                         .ok()
                     });
@@ -831,6 +907,7 @@ struct ExistingSetup {
     flake_override: String,
 }
 
+#[cfg(test)]
 impl ExistingSetup {
     fn validate(&self, saved: &Saved) -> Result<()> {
         let host = if self.flake_override.is_empty() {
@@ -838,7 +915,9 @@ impl ExistingSetup {
         } else {
             self.flake_override.clone()
         };
-        config::RebuildTarget::validate_selector(&host, Path::new(&self.path))
+        self.selector
+            .catalog_context(&host, true)
+            .map(|_| ())
             .map_err(|error| format!("Existing setup at {} is incomplete: {error}", self.path))
     }
 }
@@ -1055,52 +1134,6 @@ fn prepare_install_process() -> Result<bool> {
         ))
     }
 }
-const CONFIGURE_GIT_SHELL: &str = "NIXOS_INSTALLER_CONFIGURE_GIT_SHELL";
-
-fn configure_git_command(executable: &Path) -> Command {
-    let package = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "github:NixOS/nixpkgs/nixpkgs-26.05-darwin#git"
-    } else {
-        "github:NixOS/nixpkgs/nixos-unstable#git"
-    };
-    let mut command = Command::new("nix");
-    command
-        .args([
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "shell",
-            package,
-            "--command",
-        ])
-        .arg(executable)
-        .env(CONFIGURE_GIT_SHELL, "1");
-    command
-}
-
-fn prepare_configure_git() -> Result<bool> {
-    if Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        return Ok(false);
-    }
-    if env::var_os(CONFIGURE_GIT_SHELL).is_some() {
-        return Err("The Nix shell did not provide a working Git executable.".into());
-    }
-    let program = env::current_exe().map_err(|error| format!("Locating the installer: {error}"))?;
-    eprintln!("Git is unavailable. Starting Configure in a user-level Nix shell with Git.");
-    let status = configure_git_command(&program)
-        .status()
-        .map_err(|error| format!("Starting a Nix shell with Git: {error}"))?;
-    if status.success() {
-        Ok(true)
-    } else {
-        Err(format!(
-            "The Configure process in the Git shell exited with {status}."
-        ))
-    }
-}
 
 fn default_request() -> InstallRequest {
     InstallRequest {
@@ -1183,18 +1216,12 @@ fn run() -> Result<()> {
         flake_override,
         cfg!(target_os = "linux"),
     )?;
-    if let Some(setup) = &setup {
-        if prepare_configure_git()? {
-            return Ok(());
-        }
-        setup.validate(&saved)?;
-    }
     let repositories = setup
         .as_ref()
         .and_then(|setup| setup.selector.repositories())
         .map(<[SourceSpec]>::to_vec)
         .unwrap_or_else(|| saved.repositories.clone());
-    let repositories = if repositories.is_empty() {
+    let repositories = if setup.is_none() && repositories.is_empty() {
         vec![SourceSpec {
             repository: "https://github.com/acup1/nixos-modules.git".into(),
             reference: "main".into(),
@@ -1217,8 +1244,8 @@ fn run() -> Result<()> {
             request.username = username;
         }
     }
-    let mut state = Session::new(mode, repositories, request, flake, selector);
-    let mut controller = Controller {
+    let state = Session::new(mode, repositories, request, flake, selector);
+    let controller = Controller {
         dir,
         sources: vec![],
         loaded: vec![],
@@ -1226,14 +1253,9 @@ fn run() -> Result<()> {
         selector: None,
         inspected_host: String::new(),
         manual: BTreeMap::new(),
+        unavailable: Vec::new(),
     };
-    if let Err(e) = controller.refresh(&mut state, false) {
-        state.message = Some((
-            format!("Catalog: {e}. Edit repositories and refresh to retry."),
-            false,
-        ));
-    }
-    ui::run(&mut state, |action, state| controller.action(action, state))
+    ui::run(state, controller, Controller::action)
 }
 fn main() {
     if let Err(e) = run() {
@@ -1277,30 +1299,8 @@ mod controller_tests {
             selector: None,
             inspected_host: String::new(),
             manual: BTreeMap::new(),
+            unavailable: Vec::new(),
         }
-    }
-
-    #[test]
-    fn configures_missing_git_via_a_user_shell_and_one_relaunch() {
-        let executable = Path::new("/tmp/installer with spaces/nixos-installer");
-        let command = configure_git_command(executable);
-        assert_eq!(command.get_program(), "nix");
-        let arguments = command.get_args().collect::<Vec<_>>();
-        assert_eq!(arguments[2], "shell");
-        assert!(
-            arguments[3]
-                .to_str()
-                .unwrap()
-                .starts_with("github:NixOS/nixpkgs/")
-        );
-        assert!(arguments[3].to_str().unwrap().ends_with("#git"));
-        assert_eq!(arguments[4], "--command");
-        assert_eq!(arguments[5], executable.as_os_str());
-        assert!(
-            command
-                .get_envs()
-                .any(|(key, value)| key == CONFIGURE_GIT_SHELL && value.is_some())
-        );
     }
 
     #[test]
@@ -1546,8 +1546,10 @@ mod controller_tests {
         };
 
         let path = fixture.0.join("manual.nix");
+        fs::write(fixture.0.join("flake.nix"), "{ outputs = inputs: {}; }").unwrap();
         let manual = format!(
-            "{{ inputs }}: {{ modules = [ {{ _componentPath = {}; home.keepThis = true; }} {{ home.legacy = true; }} ]; }}",
+            "{{ inputs }}: {{ flakeDir = {}; modules = [ {{ _componentPath = {}; home.keepThis = true; }} {{ home.legacy = true; }} ]; }}",
+            config::quote(fixture.0.to_str().unwrap()),
             config::quote(definition.to_str().unwrap()),
         );
         fs::write(&path, &manual).unwrap();
@@ -1599,7 +1601,7 @@ mod controller_tests {
         let path_names = [definition.display().to_string()];
         let rows = &state.modules;
         assert_eq!(
-            manual_matches(&path, &path_names, &[remote.clone()], &rows[..1]).len(),
+            manual_matches(&path, &path_names, &[remote.clone()], &rows[..1], true).len(),
             1
         );
         assert!(
@@ -1607,20 +1609,22 @@ mod controller_tests {
                 &path,
                 &path_names,
                 &[remote.clone(), editor.sources[1].clone()],
-                rows
+                rows,
+                true,
             )
             .contains_key(&(1, "demo".into()))
         );
         remote.spec.reference = "1234567890123456789012345678901234567890".into();
         remote.revision = Some(remote.spec.reference.clone());
         let mut pinned_sources = vec![remote.spec.clone()];
-        add_manual_sources(&path_names, &mut pinned_sources);
+        add_local_sources(&[], &path_names, &mut pinned_sources);
         assert_eq!(pinned_sources, vec![remote.spec.clone(), spec.clone()]);
         let result = manual_matches(
             &path,
             &path_names,
             &[remote, editor.sources[1].clone()],
             rows,
+            true,
         );
         assert_eq!(
             result.keys().cloned().collect::<Vec<_>>(),
@@ -1650,5 +1654,165 @@ mod controller_tests {
             fs::read_to_string(path.with_extension("pre-installer.nix")).unwrap(),
             manual
         );
+    }
+    #[test]
+    fn managed_plain_catalogs_restore_mask_and_discover_unselected_platform_modules() {
+        if Command::new("nix").arg("--version").output().is_err() {
+            return;
+        }
+        let fixture = Fixture::new();
+        let root = fixture.0.canonicalize().unwrap();
+        fs::write(root.join("flake.nix"), "{ outputs = inputs: {}; }").unwrap();
+        let detected = root.join("auto catalog");
+        let explicit = root.join("explicit catalog");
+        let primary = detected.join("primary");
+        let supported = explicit.join("available");
+        let foreign = explicit.join("foreign");
+        let native_layer = if cfg!(target_os = "macos") {
+            ("darwin", "darwin")
+        } else {
+            ("nixos", "linux")
+        };
+        let foreign_layer = if cfg!(target_os = "macos") {
+            ("nixos", "linux")
+        } else {
+            ("darwin", "darwin")
+        };
+        for (path, (layer, platform)) in [
+            (&primary, native_layer),
+            (&supported, native_layer),
+            (&foreign, foreign_layer),
+        ] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("default.nix"), format!(
+                "{{ _componentPath = builtins.dirOf (toString ./default.nix); {layer} = {{}}; }}"
+            )).unwrap();
+            fs::write(
+                path.join("module.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 1,
+                    "title": path.file_name().unwrap().to_str().unwrap(),
+                    "description": "Catalog fixture",
+                    "layers": {layer: [platform]}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let path = root.join("config.nix");
+        fs::write(&path, format!(
+            "{{ inputs }}: {{ flakeDir = {}; moduleSources = [ {} ]; modules = [ (import (builtins.toPath {})) ]; }}",
+            config::quote(root.to_str().unwrap()),
+            config::quote(explicit.to_str().unwrap()),
+            config::quote(primary.join("default.nix").to_str().unwrap()),
+        )).unwrap();
+        let manual = Selector::read(&path).unwrap().unwrap();
+        // A v2 selector which never recorded this private catalog as a repository.
+        let mask = BTreeSet::from([primary.to_str().unwrap().into()]);
+        manual
+            .save("[]".into(), "[]".into(), mask.clone(), vec![], vec![])
+            .unwrap();
+        let start = || {
+            Session::new(
+                Mode::Configure,
+                vec![],
+                default_request(),
+                String::new(),
+                path.to_str().unwrap().into(),
+            )
+        };
+        let mut state = start();
+        let mut editor = controller(&root.join("state"));
+        editor.refresh(&mut state, false).unwrap();
+        assert_eq!(state.repositories.len(), 2);
+        assert!(
+            editor
+                .sources
+                .iter()
+                .all(|source| source.revision.is_none())
+        );
+        assert_eq!(
+            state
+                .modules
+                .iter()
+                .map(|row| (row.module.path.as_str(), row.selected))
+                .collect::<Vec<_>>(),
+            [("available", false), ("primary", false)]
+        );
+        state.modules[0].selected = true;
+        editor.refresh(&mut state, true).unwrap();
+        assert!(
+            editor
+                .check_local_install(&editor.choices(&state).unwrap())
+                .unwrap_err()
+                .contains("plain catalog")
+        );
+        editor.save(&mut state).unwrap();
+        drop(editor);
+
+        let mut reopened = start();
+        let mut editor = controller(&root.join("state"));
+        editor.refresh(&mut reopened, false).unwrap();
+        assert!(reopened.modules[0].selected);
+        assert!(!reopened.modules[1].selected);
+        assert_eq!(Selector::read(&path).unwrap().unwrap().masked(), mask);
+        let selector = fs::read_to_string(&path).unwrap();
+        assert!(selector.contains(&config::quote(explicit.to_str().unwrap())));
+        assert!(!selector.contains("builtins.fetchGit"));
+    }
+    #[test]
+    fn uncached_remote_leaves_local_catalog_browsable_and_blocks_writes() {
+        if Command::new("nix").arg("--version").output().is_err() {
+            return;
+        }
+        let fixture = Fixture::new();
+        let root = fixture.0.canonicalize().unwrap();
+        fs::write(root.join("flake.nix"), "{ outputs = inputs: {}; }").unwrap();
+        let catalog = root.join("plain");
+        let module = catalog.join("demo");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("default.nix"), "{ home = {}; }").unwrap();
+        fs::write(
+            module.join("module.json"),
+            r#"{
+            "schemaVersion": 1,
+            "title": "Demo",
+            "description": "Local catalog",
+            "layers": { "home": ["linux", "darwin"] }
+        }"#,
+        )
+        .unwrap();
+        let selector = root.join("config.nix");
+        let original = format!(
+            "{{ inputs }}: {{ flakeDir = {}; moduleSources = [ {} ]; modules = []; }}",
+            config::quote(root.to_str().unwrap()),
+            config::quote(catalog.to_str().unwrap())
+        );
+        fs::write(&selector, &original).unwrap();
+        let missing = SourceSpec {
+            repository: "https://no-network.invalid/catalog.git".into(),
+            reference: "1234567890123456789012345678901234567890".into(),
+            mode: SourceMode::Pinned,
+        };
+        let mut state = Session::new(
+            Mode::Configure,
+            vec![missing],
+            default_request(),
+            String::new(),
+            selector.to_str().unwrap().into(),
+        );
+        let mut editor = controller(&root.join("state"));
+        editor.refresh(&mut state, false).unwrap();
+        assert!(
+            state
+                .catalog_warning
+                .as_deref()
+                .unwrap()
+                .contains("Refresh catalog")
+        );
+        assert_eq!(state.modules.len(), 1);
+        assert_eq!(state.modules[0].repository, 1);
+        assert!(editor.save(&mut state).unwrap_err().contains("unavailable"));
+        assert_eq!(fs::read_to_string(selector).unwrap(), original);
     }
 }
