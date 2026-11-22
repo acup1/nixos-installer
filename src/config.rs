@@ -162,7 +162,7 @@ pub fn selection(locations: &[Location], choices: &[Choice]) -> Result<String> {
     Ok(out)
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Selected {
     pub source: SourceSpec,
     pub path: String,
@@ -251,7 +251,7 @@ pub fn validate_username(username: &str, darwin: bool) -> Result<()> {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Record {
     base: Base,
     modules: String,
@@ -263,7 +263,7 @@ struct Record {
     identity: Identity,
 }
 
-const MARKER: &str = "# Managed by nixos-installer v2\n";
+const MARKER: &str = "# Managed by nixos-installer v2";
 const STATE_PREFIX: &str = "# Selection: ";
 const PATH_OF: &str = r#"bundle:
     let path = if builtins.isAttrs bundle then bundle._componentPath or null else null;
@@ -371,6 +371,41 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_extension("pre-installer.nix")
 }
 
+// Ignore whitespace between syntax elements, keeping comments, string contents,
+// and whitespace-sensitive boundaries such as the end of a Nix path literal.
+fn same_nix_structure(left: rnix::SyntaxNode, right: rnix::SyntaxNode) -> bool {
+    use rnix::{NodeOrToken, SyntaxKind::TOKEN_WHITESPACE};
+    let children = |node: rnix::SyntaxNode| {
+        node.children_with_tokens()
+            .filter(|child| child.kind() != TOKEN_WHITESPACE)
+    };
+    let mut other = children(right);
+    children(left).all(|child| match (child, other.next()) {
+        (NodeOrToken::Node(a), Some(NodeOrToken::Node(b))) => {
+            a.kind() == b.kind() && same_nix_structure(a, b)
+        }
+        (NodeOrToken::Token(a), Some(NodeOrToken::Token(b))) => {
+            a.kind() == b.kind()
+                && (a.text() == b.text()
+                    || (a.kind() == rnix::SyntaxKind::TOKEN_COMMENT
+                        && a.text().starts_with('#')
+                        && a.text().trim_end_matches('\r') == b.text().trim_end_matches('\r')))
+        }
+        _ => false,
+    }) && other.next().is_none()
+}
+
+fn matches_managed_text(actual: &str, expected: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let actual = rnix::Root::parse(actual);
+    let expected = rnix::Root::parse(expected);
+    actual.errors().is_empty()
+        && expected.errors().is_empty()
+        && same_nix_structure(actual.syntax(), expected.syntax())
+}
+
 fn render(path: &Path, record: &Record) -> Result<String> {
     render_with_original(path, record, None)
 }
@@ -433,7 +468,7 @@ fn render_with_original(path: &Path, record: &Record, original: Option<&Path>) -
         .collect::<Vec<_>>()
         .join(" ");
     Ok(format!(
-        "{MARKER}{STATE_PREFIX}{state}\nargs: let\n  base = {base};\n  selected = {};\n  masked = [ {masked} ];\n  changes = {};\n  pathOf = {PATH_OF};\n  keep = bundle: !(builtins.elem (pathOf bundle) masked);\n  modify = bundle: builtins.foldl' (current: change:\n    if pathOf bundle == change.path then builtins.mapAttrs (layer: original:\n      if builtins.hasAttr layer change.layers then {{ imports = [ original change.layers.${{layer}} ]; }}\n      else original) current\n    else current) bundle changes;\nin base // {{{identity} modules = map modify (builtins.filter keep (base.modules or [])) ++ selected{system_change}; }}\n",
+        "{MARKER}\n{STATE_PREFIX}{state}\nargs: let\n  base = {base};\n  selected = {};\n  masked = [ {masked} ];\n  changes = {};\n  pathOf = {PATH_OF};\n  keep = bundle: !(builtins.elem (pathOf bundle) masked);\n  modify = bundle: builtins.foldl' (current: change:\n    if pathOf bundle == change.path then builtins.mapAttrs (layer: original:\n      if builtins.hasAttr layer change.layers then {{ imports = [ original change.layers.${{layer}} ]; }}\n      else original) current\n    else current) bundle changes;\nin base // {{{identity} modules = map modify (builtins.filter keep (base.modules or [])) ++ selected{system_change}; }}\n",
         record.modules, record.changes,
     ))
 }
@@ -478,10 +513,10 @@ impl InstalledEdit {
             return Err("The installed selector's base or manual imports changed.".into());
         }
         self.record.identity.validate()?;
-        let text = render(&selector.path, &self.record)?;
-        if text.as_bytes() == selector.file.bytes {
+        if selector.record.as_ref() == Some(&self.record) {
             return Ok(());
         }
+        let text = render(&selector.path, &self.record)?;
         write_atomic(
             &selector.path,
             text.as_bytes(),
@@ -518,15 +553,15 @@ impl Selector {
             return Ok(None);
         };
         let text = std::str::from_utf8(&file.bytes).map_err(|_| "Selector must be UTF-8")?;
-        let record = if let Some(body) = text.strip_prefix(MARKER) {
-            let contents = body
-                .lines()
+        let mut lines = text.lines();
+        let record = if lines.next() == Some(MARKER) {
+            let contents = lines
                 .next()
                 .and_then(|line| line.strip_prefix(STATE_PREFIX))
                 .ok_or("Managed selector is missing its selection metadata")?;
             let record: Record = serde_json::from_str(contents)
                 .map_err(|error| format!("Invalid selector metadata: {error}"))?;
-            if render(path, &record)? != text {
+            if !matches_managed_text(text, &render(path, &record)?) {
                 return Err(format!(
                     "{} was edited outside the installer. Its changes were preserved.",
                     path.display()
@@ -774,7 +809,7 @@ impl Selector {
             identity,
         };
         record.identity.validate()?;
-        if render(&self.path, &record)?.as_bytes() == self.file.bytes {
+        if self.record.as_ref() == Some(&record) {
             return Ok(());
         }
         let expected =
@@ -837,10 +872,10 @@ impl Selector {
             identity,
         };
         record.identity.validate()?;
-        let text = render(&self.path, &record)?;
-        if self.file.bytes == text.as_bytes() {
+        if self.record.as_ref() == Some(&record) {
             return Ok(());
         }
+        let text = render(&self.path, &record)?;
         if matches!(record.base, Base::Original) {
             let backup = backup_path(&self.path);
             if let Some(original) = &self.backup {
@@ -1380,6 +1415,58 @@ mod selector_tests {
             !saved.installed(),
             "only the real system path permits elevation"
         );
+    }
+
+    #[test]
+    fn formatted_selector_reopens_and_noop_save_preserves_its_bytes() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.nix");
+        fs::write(&path, ORIGINAL).unwrap();
+        let original = Selector::read(&path).unwrap().unwrap();
+        configure(&path, &original, BTreeSet::new(), "[]");
+        let canonical = fs::read_to_string(&path).unwrap();
+        let formatted = canonical
+            .replace("args: let", "args:\nlet")
+            .replace("in base // { modules", "in\n  base // {modules")
+            .replace("selected = [];", "selected = [\n  ];")
+            .replace('\n', "\r\n");
+        fs::write(&path, &formatted).unwrap();
+        let reopened = Selector::read(&path).unwrap().unwrap();
+        configure(&path, &reopened, BTreeSet::new(), "[]");
+        assert_eq!(fs::read_to_string(&path).unwrap(), formatted);
+
+        let edited = formatted.replace("selected = [", "selected = [ {} ");
+        fs::write(&path, &edited).unwrap();
+        assert!(Selector::read(&path).is_err());
+        assert!(
+            reopened
+                .save(
+                    "[]".into(),
+                    "[]".into(),
+                    BTreeSet::new(),
+                    vec![],
+                    vec![],
+                    Identity::default()
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(fs::read_to_string(backup_path(&path)).unwrap(), ORIGINAL);
+    }
+
+    #[test]
+    fn selector_formatting_preserves_literal_contents_and_token_boundaries() {
+        assert!(matches_managed_text("{ a = \"x y\"; }", "{a=\"x y\";}"));
+        for (original, edit) in [
+            ("\"x y\"", "\"xy\""),
+            ("''x  y''", "''x y''"),
+            ("let a = 1; in a", "leta = 1; in a"),
+            ("[ ./a ./b ]", "[ ./a./b ]"),
+            ("{ a = true; }", "{ a = false; }"),
+            ("{}", "{} # keep this"),
+        ] {
+            assert!(!matches_managed_text(original, edit), "{edit}");
+        }
     }
 
     #[test]
