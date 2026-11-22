@@ -3,7 +3,7 @@ set -eu
 umask 077
 
 # Checked against Cargo.toml and the Git tag by the release workflow.
-release='v0.2.0'
+release='v0.2.1'
 case "$(uname -s)" in
     Linux) os=linux ;;
     Darwin) os=darwin ;;
@@ -39,11 +39,10 @@ if [ "${digest%% *}" != "$expected" ]; then
 fi
 chmod 700 "$tmp/$asset"
 
-# The launcher is commonly piped into sh. Give interactive programs the terminal.
-case "${1:-}" in
-    --help|--version|-h|-V) ;;
-    *) if [ ! -t 0 ]; then exec </dev/tty; fi ;;
-esac
+# Keep the script reader on the pipe. Only the interactive child uses the terminal.
+interactive() {
+    if [ -t 0 ]; then "$@"; else "$@" </dev/tty; fi
+}
 find_nix() {
     if command -v nix >/dev/null 2>&1; then return 0; fi
     for profile in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh "$HOME/.nix-profile/etc/profile.d/nix.sh"; do
@@ -60,14 +59,17 @@ if ! find_nix; then
     if [ "$os" = linux ] && { [ ! -d /run/systemd/system ] || [ -e /sys/fs/selinux/enforce ]; }; then
         fetch https://artifacts.nixos.org/nix-installer "$tmp/install-nix"
         if [ -d /run/systemd/system ]; then
-            sh "$tmp/install-nix" install linux
+            interactive sh "$tmp/install-nix" install linux
         else
-            sh "$tmp/install-nix" install linux --init none
+            interactive sh "$tmp/install-nix" install linux --init none
         fi
     else
         fetch https://nixos.org/nix/install "$tmp/install-nix"
-        sh "$tmp/install-nix" --daemon
+        interactive sh "$tmp/install-nix" --daemon
     fi
     find_nix || { echo "The official installer finished but nix is unavailable." >&2; exit 1; }
 fi
-"$tmp/$asset" "$@"
+case "${1:-}" in
+    --help|--version|-h|-V) "$tmp/$asset" "$@" ;;
+    *) interactive "$tmp/$asset" "$@" ;;
+esac

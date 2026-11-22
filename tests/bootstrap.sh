@@ -21,7 +21,12 @@ esac
 EOF
 cat > "$fixture/binary" <<'EOF'
 #!/bin/sh
-echo "$asset $1"
+if [ "$#" -eq 0 ]; then
+    test -t 0 || exit 2
+    echo interactive-binary-on-tty
+else
+    echo "$asset $1"
+fi
 EOF
 for tool in nix git; do printf '#!/bin/sh\nexit 99\n' > "$fixture/bin/$tool"; done
 chmod +x "$fixture"/bin/*
@@ -34,6 +39,35 @@ for pair in 'Linux aarch64 aarch64-linux' 'Darwin arm64 aarch64-darwin' \
     printf '%s  %s\n' "${digest%% *}" "$asset" > "$fixture/sums"
     test "$(sh bootstrap.sh --version)" = "$asset --version"
 done
+# A real controlling terminal catches sh continuing to read script commands from /dev/tty.
+python3 - <<'PYTHON'
+import os, pty, select, signal, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("/bin/sh", ["sh", "-c", "cat bootstrap.sh | sh"])
+data = bytearray()
+try:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if select.select([fd], [], [], 0.25)[0]:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError as error:
+                if error.errno != 5:  # Linux ptys report EIO at end of file.
+                    raise
+                break
+            if not chunk:
+                break
+            data.extend(chunk)
+    else:
+        os.kill(pid, signal.SIGTERM)
+        raise RuntimeError("piped launcher failed to exit")
+finally:
+    os.close(fd)
+    _, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 0, data
+assert b"interactive-binary-on-tty" in data, data
+PYTHON
 echo 'corrupted payload' >> "$fixture/binary"
 if sh bootstrap.sh --version; then exit 1; fi
 machine=s390x
