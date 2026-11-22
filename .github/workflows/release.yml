@@ -20,6 +20,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Test release launcher
+        run: sh tests/bootstrap.sh
       - name: Install Rust target
         run: rustup target add "${{ matrix.target }}"
       - name: Install musl linker
@@ -74,5 +76,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           test "$GITHUB_REF_NAME" = "v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          (cd dist && sha256sum nixos-installer-* > SHA256SUMS)
+          grep -Fx "release='$GITHUB_REF_NAME'" bootstrap.sh
+          cp bootstrap.sh dist/
+          sh -n dist/bootstrap.sh
+          (cd dist && sha256sum bootstrap.sh nixos-installer-* > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes dist/*

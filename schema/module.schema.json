@@ -31,6 +31,7 @@
         "required": ["layer", "path", "type", "title", "description"],
         "properties": {
           "layer": {"enum": ["nixos", "darwin", "home"]},
+          "platforms": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["linux", "darwin"]}},
           "path": {
             "type": "array",
             "minItems": 1,

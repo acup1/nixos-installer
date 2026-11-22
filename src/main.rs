@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -28,6 +28,21 @@ struct Saved {
     flake: String,
     flake_override: String,
     selector: String,
+}
+
+fn detected_flake(selector: Option<&Selector>, saved: &Saved, path: &str) -> Result<String> {
+    Ok(selector
+        .map(Selector::flake_dir)
+        .transpose()?
+        .flatten()
+        .filter(|reference| !reference.trim().is_empty())
+        .unwrap_or_else(|| {
+            if saved.selector == path {
+                saved.flake.clone()
+            } else {
+                String::new()
+            }
+        }))
 }
 
 fn layer_name(layer: Layer) -> &'static str {
@@ -78,20 +93,8 @@ impl Controller {
         } else {
             None
         };
-        state.detected_flake = if state.flake.is_empty() {
-            selector
-                .as_ref()
-                .map(Selector::flake_dir)
-                .transpose()?
-                .flatten()
-                .filter(|reference| !reference.trim().is_empty())
-                .unwrap_or_else(|| {
-                    if self.saved.selector == state.selector {
-                        self.saved.flake.clone()
-                    } else {
-                        String::new()
-                    }
-                })
+        state.detected_flake = if state.mode == Mode::Configure && state.flake.is_empty() {
+            detected_flake(selector.as_ref(), &self.saved, &state.selector)?
         } else {
             String::new()
         };
@@ -117,7 +120,7 @@ impl Controller {
         } else {
             HashMap::new()
         };
-        let repositories = if !same_selector {
+        let mut repositories = if !same_selector {
             selector
                 .as_ref()
                 .and_then(Selector::repositories)
@@ -131,6 +134,12 @@ impl Controller {
             .map(|selector| selector.original_paths(state.host_flake()))
             .transpose()?
             .unwrap_or_default();
+        if selector
+            .as_ref()
+            .is_some_and(|selector| !selector.managed())
+        {
+            add_manual_sources(&originals, &mut repositories);
+        }
         let persisted = selector
             .as_ref()
             .map(Selector::selections)
@@ -157,7 +166,15 @@ impl Controller {
                 return Err(format!("Duplicate repository {}", spec.repository));
             }
             let cache = self.dir.join("repositories");
-            let source = if update {
+            let source = if let Some(source) = selector
+                .as_ref()
+                .filter(|selector| selector.installed())
+                .map(|_| installed_local_checkout(spec, Path::new("/etc/nixos")))
+                .transpose()?
+                .flatten()
+            {
+                source
+            } else if update {
                 catalog::discover_updated(spec, &cache)?
             } else {
                 catalog::discover(spec, &cache)?
@@ -256,7 +273,18 @@ impl Controller {
             .map(|(i, s)| {
                 Ok(match s.spec.mode {
                     SourceMode::Local if target_copy => Location::TargetCopy(i),
-                    SourceMode::Local => Location::Local(s.checkout.clone()),
+                    SourceMode::Local => {
+                        let installed = self
+                            .selector
+                            .as_ref()
+                            .filter(|selector| selector.installed());
+                        match installed.and_then(|_| {
+                            installed_source_index(&s.checkout, Path::new("/etc/nixos"))
+                        }) {
+                            Some(index) => Location::TargetCopy(index),
+                            None => Location::Local(s.checkout.clone()),
+                        }
+                    }
                     SourceMode::Pinned => Location::Remote {
                         url: s.spec.repository.clone(),
                         rev: s.revision.clone().ok_or("Missing source revision")?,
@@ -366,13 +394,22 @@ impl Controller {
 
         let saved = self.synchronized_state(state, false);
         if selector.managed() || !new.is_empty() || !changes.is_empty() || !masked.is_empty() {
-            selector.save(
-                config::selection(&self.locations(false)?, &new)?,
-                config::manual_changes(&changes)?,
-                masked,
-                saved.selections.clone(),
-                saved.repositories.clone(),
-            )?;
+            let modules = config::selection(&self.locations(false)?, &new)?;
+            if selector.installed() && !effective_user_is_root()? {
+                selector.save_installed_with_sudo(
+                    modules,
+                    saved.selections.clone(),
+                    saved.repositories.clone(),
+                )?;
+            } else {
+                selector.save(
+                    modules,
+                    config::manual_changes(&changes)?,
+                    masked,
+                    saved.selections.clone(),
+                    saved.repositories.clone(),
+                )?;
+            }
             self.selector = Selector::read(path)?;
         }
         state.repositories = saved.repositories.clone();
@@ -427,7 +464,11 @@ impl Controller {
                 .map_err(|e| e.to_string())?;
             Ok(())
         })?;
-        Ok("Installation completed".into())
+        Ok(if matches!(state.install.layout, DiskLayout::InPlace) {
+            "NixOS boot entry is ready. Reboot manually to enter NixOS and preserve the former root under /old-root.".into()
+        } else {
+            "Installation completed".into()
+        })
     }
     fn check_local_install(&self, choices: &[Choice]) -> Result<()> {
         for (i, source) in self.sources.iter().enumerate() {
@@ -555,6 +596,57 @@ fn checkout_origin(root: &Path) -> Option<(String, String)> {
     ))
 }
 
+fn add_manual_sources(originals: &[String], repositories: &mut Vec<SourceSpec>) {
+    let checkouts: BTreeSet<PathBuf> = originals
+        .iter()
+        .filter_map(|original| {
+            let path = Path::new(original);
+            if !path.is_absolute() || path.starts_with("/nix/store") {
+                return None;
+            }
+            let directory = path.canonicalize().ok()?;
+            if !["default.nix", "module.json"].iter().all(|name| {
+                fs::symlink_metadata(directory.join(name)).is_ok_and(|file| file.is_file())
+            }) {
+                return None;
+            }
+            let root = PathBuf::from(git_output(&directory, &["rev-parse", "--show-toplevel"])?)
+                .canonicalize()
+                .ok()?;
+            let relative = directory.strip_prefix(&root).ok()?.to_str()?;
+            catalog::validate_module_path(relative).ok()?;
+            Some(root)
+        })
+        .collect();
+
+    for root in checkouts {
+        let existing = repositories.iter().any(|spec| {
+            if spec.mode != SourceMode::Local
+                || !Path::new(&spec.repository)
+                    .canonicalize()
+                    .is_ok_and(|path| path == root)
+            {
+                return false;
+            }
+            match spec.reference.as_str() {
+                "" | "HEAD" => true,
+                name => git_output(&root, &["symbolic-ref", "--quiet", "HEAD"])
+                    .as_deref()
+                    .is_some_and(|head| {
+                        head == name || head.strip_prefix("refs/heads/") == Some(name)
+                    }),
+            }
+        });
+        if !existing && let Some(repository) = root.to_str() {
+            repositories.push(SourceSpec {
+                repository: repository.into(),
+                reference: "HEAD".into(),
+                mode: SourceMode::Local,
+            });
+        }
+    }
+}
+
 fn manual_matches(
     selector: &Path,
     originals: &[String],
@@ -566,7 +658,8 @@ fn manual_matches(
     let mut fetched = BTreeMap::new();
     for original in originals {
         let absolute = Path::new(original);
-        let mut candidates = Vec::new();
+        let mut local = Vec::new();
+        let mut inferred = Vec::new();
         for row in rows {
             let relative = Path::new(&row.module.path);
             if !absolute.ends_with(relative) {
@@ -577,14 +670,17 @@ fn manual_matches(
                 continue;
             };
             let source = &sources[row.repository];
-            let mut same = root
+            if root
                 .canonicalize()
-                .is_ok_and(|path| path == source.checkout);
-            if !same
-                && source.spec.mode == SourceMode::Pinned
+                .is_ok_and(|path| path == source.checkout)
+            {
+                local.push((row.repository, row.module.path.clone()));
+                continue;
+            }
+            if source.spec.mode == SourceMode::Pinned
                 && let Some(revision) = source.revision.as_deref()
             {
-                if root.starts_with("/nix/store") {
+                let same = if root.starts_with("/nix/store") {
                     let fetched_root = fetched.entry(row.repository).or_insert_with(|| {
                         config::remote_root(
                             selector,
@@ -595,23 +691,24 @@ fn manual_matches(
                         )
                         .ok()
                     });
-                    same = fetched_root
+                    fetched_root
                         .as_ref()
-                        .is_some_and(|fetched| Path::new(fetched) == root);
+                        .is_some_and(|fetched| Path::new(fetched) == root)
                 } else {
                     let actual = origins
                         .entry(root.to_path_buf())
                         .or_insert_with(|| checkout_origin(root));
-                    same = actual.as_ref().is_some_and(|(url, commit)| {
+                    actual.as_ref().is_some_and(|(url, commit)| {
                         commit == revision
                             && remote_identity(&source.spec.repository).as_ref() == Some(url)
-                    });
+                    })
+                };
+                if same {
+                    inferred.push((row.repository, row.module.path.clone()));
                 }
             }
-            if same {
-                candidates.push((row.repository, row.module.path.clone()));
-            }
         }
+        let candidates = if local.is_empty() { inferred } else { local };
         if let [key] = candidates.as_slice() {
             matches.entry(key.clone()).or_default().push(original);
         }
@@ -627,6 +724,64 @@ fn manual_matches(
             Some((key, (*path).clone()))
         })
         .collect()
+}
+
+fn installed_source_index(checkout: &Path, system_directory: &Path) -> Option<usize> {
+    let name = checkout
+        .strip_prefix(system_directory.join("module-sources"))
+        .ok()?
+        .to_str()?;
+    let index = name.parse::<usize>().ok()?;
+    (index.to_string() == name).then_some(index)
+}
+
+fn installed_local_checkout(
+    spec: &SourceSpec,
+    system_directory: &Path,
+) -> Result<Option<CatalogSource>> {
+    use std::os::unix::fs::MetadataExt;
+
+    if spec.mode != SourceMode::Local || !matches!(spec.reference.as_str(), "" | "HEAD") {
+        return Ok(None);
+    }
+    let sources = system_directory.join("module-sources");
+    let checkout = Path::new(&spec.repository);
+    if installed_source_index(checkout, system_directory).is_none() {
+        return Ok(None);
+    }
+    let git_directory = checkout.join(".git");
+    for directory in [system_directory, &sources, checkout, &git_directory] {
+        let stat = fs::symlink_metadata(directory)
+            .map_err(|error| format!("Inspecting {}: {error}", directory.display()))?;
+        if !stat.is_dir() || stat.uid() != 0 || stat.mode() & 0o022 != 0 {
+            return Err(format!(
+                "Expected a root-owned installed repository at {}",
+                directory.display()
+            ));
+        }
+    }
+    let head = git_directory.join("HEAD");
+    let stat = fs::symlink_metadata(&head)
+        .map_err(|error| format!("Inspecting {}: {error}", head.display()))?;
+    if !stat.is_file() || stat.uid() != 0 || stat.mode() & 0o022 != 0 {
+        return Err(format!(
+            "Invalid installed repository HEAD at {}",
+            head.display()
+        ));
+    }
+    let revision = fs::read_to_string(&head)
+        .map_err(|error| format!("Reading {}: {error}", head.display()))?;
+    let revision = revision.trim();
+    if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!("Expected a detached commit at {}", head.display()));
+    }
+    Ok(Some(CatalogSource {
+        spec: spec.clone(),
+        checkout: checkout.to_path_buf(),
+        revision: Some(revision.into()),
+        modules: catalog::read_checkout(checkout)?,
+    }))
 }
 
 fn copy_commit(source: &CatalogSource, dest: &Path) -> Result<()> {
@@ -668,7 +823,285 @@ fn copy_commit(source: &CatalogSource, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-const HELP: &str = "nixos-installer [configure|install]\n\nconfigure  Select module repositories, edit parameters and rebuild with nh.\ninstall    Install NixOS on a Linux machine (root required to apply).\n\nThe selector config.nix supplies flakeDir. Set a host flake override to use another reference or target.\n  --version    Print the release version\n  --help       Show this help";
+const HELP: &str = "nixos-installer\n\nOpens the configuration editor when a usable config.nix and host flake are present. Opens the installation wizard on Linux without an existing setup (root required to apply).\n\nUse NIXOS_BASE_CONFIG to select another config.nix. Its flakeDir supplies the host flake.\n  --version    Print the release version\n  --help       Show this help";
+
+struct ExistingSetup {
+    path: String,
+    selector: Selector,
+    flake_override: String,
+}
+
+impl ExistingSetup {
+    fn validate(&self, saved: &Saved) -> Result<()> {
+        let host = if self.flake_override.is_empty() {
+            detected_flake(Some(&self.selector), saved, &self.path)?
+        } else {
+            self.flake_override.clone()
+        };
+        config::RebuildTarget::validate_selector(&host, Path::new(&self.path))
+            .map_err(|error| format!("Existing setup at {} is incomplete: {error}", self.path))
+    }
+}
+
+fn path_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("Inspecting {}: {error}", path.display())),
+    }
+}
+
+fn existing_setup(
+    home: &Path,
+    system_config: &Path,
+    saved: &Saved,
+    selector_override: Option<&Path>,
+    flake_override: Option<String>,
+    can_install: bool,
+) -> Result<Option<ExistingSetup>> {
+    let home_selector = home.join(".config/config.nix");
+    let installed_selector = system_config.join("config.nix");
+    let saved_selector = Path::new(&saved.selector);
+    let path = if let Some(path) = selector_override {
+        Some(path)
+    } else if path_present(&home_selector)? {
+        Some(home_selector.as_path())
+    } else if !saved.selector.is_empty() && path_present(saved_selector)? {
+        Some(saved_selector)
+    } else if path_present(&installed_selector)? {
+        Some(installed_selector.as_path())
+    } else {
+        None
+    };
+
+    if let Some(path) = path {
+        let name = path.to_str().ok_or("Selector path must be UTF-8")?;
+        let selector = Selector::read(path)?
+            .ok_or_else(|| format!("Selector {} is missing. Restore it or set NIXOS_BASE_CONFIG to an existing selector.", path.display()))?;
+        let flake_override = flake_override
+            .or_else(|| {
+                (saved.selector == name && !saved.flake_override.is_empty())
+                    .then(|| saved.flake_override.clone())
+            })
+            .unwrap_or_default();
+        return Ok(Some(ExistingSetup {
+            path: name.into(),
+            selector,
+            flake_override,
+        }));
+    }
+
+    for marker in [
+        home_selector.with_extension("pre-installer.nix"),
+        installed_selector.with_extension("pre-installer.nix"),
+        system_config.join("nixos-installer-state.json"),
+    ] {
+        if path_present(&marker)? {
+            return Err(format!(
+                "Found an existing setup at {}. Restore its config.nix or set NIXOS_BASE_CONFIG to the selector.",
+                marker.display()
+            ));
+        }
+    }
+    if !saved.selector.is_empty() {
+        return Err(format!(
+            "Saved selector {} is missing. Restore it or set NIXOS_BASE_CONFIG to an existing selector.",
+            saved_selector.display()
+        ));
+    }
+    if flake_override.is_some() || !saved.flake.is_empty() || !saved.flake_override.is_empty() {
+        return Err(
+            "A host flake was set without a selector. Restore config.nix or set NIXOS_BASE_CONFIG."
+                .into(),
+        );
+    }
+    if !can_install {
+        return Err("No configuration selector found. Create config.nix or set NIXOS_BASE_CONFIG. The installation wizard requires Linux.".into());
+    }
+    Ok(None)
+}
+
+fn read_saved(path: &Path) -> Result<Option<Saved>> {
+    match fs::read(path) {
+        Ok(data) => serde_json::from_slice(&data)
+            .map(Some)
+            .map_err(|error| format!("Invalid saved state at {}: {error}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Reading saved state at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+const INSTALL_TOOLS: &str = "NIXOS_INSTALLER_NIX_SHELL";
+const SYSTEM_PATH: &str =
+    "/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn effective_user_is_root() -> Result<bool> {
+    let id = ["/usr/bin/id", "/bin/id", "/run/current-system/sw/bin/id"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .ok_or("Cannot locate the system id program.")?;
+    let current = Command::new(id)
+        .arg("-u")
+        .output()
+        .map_err(|error| format!("Reading current user: {error}"))?;
+    if !current.status.success() {
+        return Err("Cannot determine the current user.".into());
+    }
+    Ok(current.stdout == b"0\n")
+}
+
+fn prepare_install_process() -> Result<bool> {
+    let program = env::current_exe()
+        .map_err(|error| format!("Cannot locate the installer executable: {error}"))?;
+    if !effective_user_is_root()? {
+        let sudo = ["/run/wrappers/bin/sudo", "/usr/bin/sudo"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .ok_or_else(|| {
+                format!(
+                    "The wizard needs root. Run {} from a root shell.",
+                    program.display()
+                )
+            })?;
+        eprint!(
+            "The installation wizard needs root to prepare disks and boot entries. Continue with sudo? [y/N] "
+        );
+        io::stderr().flush().map_err(|error| error.to_string())?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+            return Ok(true);
+        }
+        let mut command = Command::new(sudo);
+        command
+            .env_clear()
+            .env("PATH", SYSTEM_PATH)
+            .args(["--"])
+            .arg(&program);
+        if let Some(term) = env::var_os("TERM") {
+            command.env("TERM", term);
+        }
+        let status = command
+            .status()
+            .map_err(|error| format!("Starting the installation wizard with sudo: {error}"))?;
+        return if status.success() {
+            Ok(true)
+        } else {
+            Err(format!("The elevated installer exited with {status}."))
+        };
+    }
+
+    if env::var_os(INSTALL_TOOLS).is_some() {
+        return Ok(false);
+    }
+    let live_bin = Path::new("/run/current-system/sw/bin");
+    let native = Path::new("/etc/NIXOS").is_file()
+        && [
+            "nixos-install",
+            "nixos-generate-config",
+            "nixos-enter",
+            "lsblk",
+            "git",
+        ]
+        .iter()
+        .all(|tool| live_bin.join(tool).is_file());
+    let mut command = if native {
+        Command::new(&program)
+    } else {
+        use std::os::unix::fs::MetadataExt;
+        let nix = ["/run/current-system/sw/bin/nix", "/nix/var/nix/profiles/default/bin/nix", "/usr/bin/nix", "/usr/local/bin/nix"]
+            .into_iter().find(|path| fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0))
+            .ok_or("Install the official multi-user Nix package manager before starting the Linux installation wizard. The installer uses root-owned Nix tools.")?;
+        let mut nix = Command::new(nix);
+        nix.args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "shell",
+        ]);
+        for package in [
+            "nixos-install-tools",
+            "util-linux",
+            "dosfstools",
+            "e2fsprogs",
+            "btrfs-progs",
+            "xfsprogs",
+            "cryptsetup",
+            "mkpasswd",
+            "systemd",
+            "git",
+        ] {
+            nix.arg(format!("github:NixOS/nixpkgs/nixos-unstable#{package}"));
+        }
+        nix.arg("--command").arg(&program);
+        nix
+    };
+    // This process either came from sudo's clean environment or is a direct
+    // root invocation. Resolve all tool names from system and Nix shell bins.
+    let status = command
+        .env("PATH", SYSTEM_PATH)
+        .env(INSTALL_TOOLS, "1")
+        .status()
+        .map_err(|error| format!("Preparing Linux installation tools: {error}"))?;
+    if status.success() {
+        Ok(true)
+    } else {
+        Err(format!(
+            "The Linux installation wizard exited with {status}."
+        ))
+    }
+}
+const CONFIGURE_GIT_SHELL: &str = "NIXOS_INSTALLER_CONFIGURE_GIT_SHELL";
+
+fn configure_git_command(executable: &Path) -> Command {
+    let package = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "github:NixOS/nixpkgs/nixpkgs-26.05-darwin#git"
+    } else {
+        "github:NixOS/nixpkgs/nixos-unstable#git"
+    };
+    let mut command = Command::new("nix");
+    command
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "shell",
+            package,
+            "--command",
+        ])
+        .arg(executable)
+        .env(CONFIGURE_GIT_SHELL, "1");
+    command
+}
+
+fn prepare_configure_git() -> Result<bool> {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return Ok(false);
+    }
+    if env::var_os(CONFIGURE_GIT_SHELL).is_some() {
+        return Err("The Nix shell did not provide a working Git executable.".into());
+    }
+    let program = env::current_exe().map_err(|error| format!("Locating the installer: {error}"))?;
+    eprintln!("Git is unavailable. Starting Configure in a user-level Nix shell with Git.");
+    let status = configure_git_command(&program)
+        .status()
+        .map_err(|error| format!("Starting a Nix shell with Git: {error}"))?;
+    if status.success() {
+        Ok(true)
+    } else {
+        Err(format!(
+            "The Configure process in the Git shell exited with {status}."
+        ))
+    }
+}
+
 fn default_request() -> InstallRequest {
     InstallRequest {
         layout: DiskLayout::Mounted {
@@ -694,7 +1127,7 @@ fn default_request() -> InstallRequest {
 
 fn run() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    let mode = match args
+    match args
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
@@ -708,13 +1141,23 @@ fn run() -> Result<()> {
             println!("{HELP}");
             return Ok(());
         }
-        [] | ["configure"] => Mode::Configure,
-        ["install"] if cfg!(target_os = "linux") => Mode::Install,
-        ["install"] => return Err("Installation requires a Linux live system".into()),
+        [config::SAVE_INSTALLED_ARG] => {
+            if !effective_user_is_root()? {
+                return Err("Saving the installed selector requires administrator access.".into());
+            }
+            return config::save_installed_from_stdin();
+        }
+        [] => {}
         _ => return Err(HELP.into()),
     };
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("Open an interactive terminal, or use --help.".into());
+    }
+    if cfg!(target_os = "linux") && path_present(Path::new("/.nixos-installer-migrate"))? {
+        return Err(
+            "In-place installation is prepared. Boot the new NixOS entry before configuring it."
+                .into(),
+        );
     }
     let home = env::var_os("HOME")
         .map(PathBuf::from)
@@ -723,41 +1166,32 @@ fn run() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/state"))
         .join("nixos-installer");
-    let mut saved_path = dir.join("state.json");
-    if mode == Mode::Configure
-        && !saved_path.exists()
-        && Path::new("/etc/nixos/nixos-installer-state.json").is_file()
-    {
-        saved_path = "/etc/nixos/nixos-installer-state.json".into();
-    }
-    let saved: Saved = match fs::read(saved_path) {
-        Ok(data) => {
-            serde_json::from_slice(&data).map_err(|e| format!("Invalid saved state: {e}"))?
+    let system_config = Path::new("/etc/nixos");
+    let saved = match read_saved(&dir.join("state.json"))? {
+        Some(saved) => saved,
+        None => read_saved(&system_config.join("nixos-installer-state.json"))?.unwrap_or_default(),
+    };
+    let selector_override = env::var_os("NIXOS_BASE_CONFIG")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let flake_override = env::var("NH_FLAKE").ok().filter(|path| !path.is_empty());
+    let setup = existing_setup(
+        &home,
+        system_config,
+        &saved,
+        selector_override.as_deref(),
+        flake_override,
+        cfg!(target_os = "linux"),
+    )?;
+    if let Some(setup) = &setup {
+        if prepare_configure_git()? {
+            return Ok(());
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Saved::default(),
-        Err(e) => return Err(e.to_string()),
-    };
-    let selector = env::var("NIXOS_BASE_CONFIG")
-        .ok()
-        .filter(|path| !path.is_empty())
-        .or_else(|| (!saved.selector.is_empty()).then(|| saved.selector.clone()))
-        .unwrap_or_else(|| home.join(".config/config.nix").display().to_string());
-    let flake = env::var("NH_FLAKE")
-        .ok()
-        .filter(|path| !path.is_empty())
-        .or_else(|| {
-            (saved.selector == selector && !saved.flake_override.is_empty())
-                .then(|| saved.flake_override.clone())
-        })
-        .unwrap_or_default();
-    let managed = if mode == Mode::Configure {
-        Selector::read(Path::new(&selector)).ok().flatten()
-    } else {
-        None
-    };
-    let repositories = managed
+        setup.validate(&saved)?;
+    }
+    let repositories = setup
         .as_ref()
-        .and_then(Selector::repositories)
+        .and_then(|setup| setup.selector.repositories())
         .map(<[SourceSpec]>::to_vec)
         .unwrap_or_else(|| saved.repositories.clone());
     let repositories = if repositories.is_empty() {
@@ -769,7 +1203,20 @@ fn run() -> Result<()> {
     } else {
         repositories
     };
-    let request = default_request();
+    let (mode, flake, selector) = match setup {
+        Some(setup) => (Mode::Configure, setup.flake_override, setup.path),
+        None => (Mode::Install, String::new(), String::new()),
+    };
+    if mode == Mode::Install && prepare_install_process()? {
+        return Ok(());
+    }
+    let mut request = default_request();
+    if mode == Mode::Install {
+        request.layout = install::default_install_layout();
+        if let Some(username) = install::suggested_account() {
+            request.username = username;
+        }
+    }
     let mut state = Session::new(mode, repositories, request, flake, selector);
     let mut controller = Controller {
         dir,
@@ -831,6 +1278,174 @@ mod controller_tests {
             inspected_host: String::new(),
             manual: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn configures_missing_git_via_a_user_shell_and_one_relaunch() {
+        let executable = Path::new("/tmp/installer with spaces/nixos-installer");
+        let command = configure_git_command(executable);
+        assert_eq!(command.get_program(), "nix");
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert_eq!(arguments[2], "shell");
+        assert!(
+            arguments[3]
+                .to_str()
+                .unwrap()
+                .starts_with("github:NixOS/nixpkgs/")
+        );
+        assert!(arguments[3].to_str().unwrap().ends_with("#git"));
+        assert_eq!(arguments[4], "--command");
+        assert_eq!(arguments[5], executable.as_os_str());
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == CONFIGURE_GIT_SHELL && value.is_some())
+        );
+    }
+
+    #[test]
+    fn installed_source_indices_preserve_relative_import_and_exclude_other_paths() {
+        let system = Path::new("/etc/nixos");
+        assert_eq!(
+            installed_source_index(Path::new("/etc/nixos/module-sources/15"), system),
+            Some(15)
+        );
+        for path in [
+            "/etc/nixos/module-sources/015",
+            "/etc/nixos/module-sources/0/child",
+            "/etc/nixos/module-sources/../0",
+            "/tmp/module-sources/0",
+        ] {
+            assert_eq!(installed_source_index(Path::new(path), system), None);
+        }
+    }
+
+    #[test]
+    fn startup_guides_only_unconfigured_linux_and_never_falls_back_from_partial_setup() {
+        let fixture = Fixture::new();
+        let home = fixture.0.join("home");
+        let etc = fixture.0.join("etc-nixos");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&etc).unwrap();
+        assert!(
+            existing_setup(&home, &etc, &Saved::default(), None, None, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            existing_setup(&home, &etc, &Saved::default(), None, None, false)
+                .err()
+                .unwrap()
+                .contains("requires Linux")
+        );
+
+        let explicit = home.join("missing.nix");
+        assert!(
+            existing_setup(&home, &etc, &Saved::default(), Some(&explicit), None, true)
+                .err()
+                .unwrap()
+                .contains("missing.nix")
+        );
+        let saved = Saved {
+            selector: explicit.display().to_string(),
+            ..Saved::default()
+        };
+        assert!(
+            existing_setup(&home, &etc, &saved, None, None, true)
+                .err()
+                .unwrap()
+                .contains("is missing")
+        );
+
+        fs::write(etc.join("configuration.nix"), "{}").unwrap();
+        fs::write(etc.join("hardware-configuration.nix"), "{}").unwrap();
+        fs::write(etc.join("flake.nix"), "{}").unwrap();
+        fs::create_dir_all(home.join("flakes/nixos-base")).unwrap();
+        fs::write(home.join("flakes/nixos-base/flake.nix"), "{}").unwrap();
+        assert!(
+            existing_setup(&home, &etc, &Saved::default(), None, None, true)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::write(etc.join("nixos-installer-state.json"), "{}").unwrap();
+        assert!(
+            existing_setup(&home, &etc, &Saved::default(), None, None, true)
+                .err()
+                .unwrap()
+                .contains("nixos-installer-state.json")
+        );
+    }
+
+    #[test]
+    fn startup_requires_a_reachable_host_flake_and_evaluable_module_bundles() {
+        if !Command::new("nix")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let fixture = Fixture::new();
+        let home = fixture.0.join("home");
+        let etc = fixture.0.join("etc-nixos");
+        let host = fixture.0.join("host");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        fs::create_dir(&etc).unwrap();
+        fs::create_dir(&host).unwrap();
+        fs::write(
+            host.join("flake.nix"),
+            r#"{
+          outputs = {self}: {
+            nixosConfigurations.machine = throw "must not build";
+            darwinConfigurations.user-OSX = throw "must not build";
+          };
+        }"#,
+        )
+        .unwrap();
+        let source = |modules: &str| {
+            format!(
+                "{{ ... }}: {{ username = \"user\"; hostName = \"machine\"; flakeDir = {}; {modules} }}",
+                config::quote(host.to_str().unwrap())
+            )
+        };
+        let installed = etc.join("config.nix");
+        fs::write(&installed, source("modules = [];")).unwrap();
+        let assess = || {
+            let saved = Saved::default();
+            let setup = existing_setup(&home, &etc, &saved, None, None, true)?;
+            if let Some(setup) = &setup {
+                setup.validate(&saved)?;
+            }
+            Ok::<_, String>(setup)
+        };
+        assert_eq!(assess().unwrap().unwrap().path, installed.to_str().unwrap());
+
+        let user = home.join(".config/config.nix");
+        fs::write(
+            &user,
+            source("modules = [ (import ./missing-module.nix) ];"),
+        )
+        .unwrap();
+        assert!(assess().err().unwrap().contains("missing-module.nix"));
+        fs::write(&user, source("")).unwrap();
+        assert!(assess().err().unwrap().contains("must declare modules"));
+        fs::write(&user, source("modules = [ {} ];")).unwrap();
+        assert_eq!(assess().unwrap().unwrap().path, user.to_str().unwrap());
+        let stale = Saved {
+            selector: fixture.0.join("outdated.nix").display().to_string(),
+            ..Saved::default()
+        };
+        assert_eq!(
+            existing_setup(&home, &etc, &stale, None, None, true)
+                .unwrap()
+                .unwrap()
+                .path,
+            user.to_str().unwrap()
+        );
+
+        fs::remove_file(host.join("flake.nix")).unwrap();
+        assert!(assess().err().unwrap().contains("incomplete"));
     }
 
     #[test]
@@ -911,6 +1526,25 @@ mod controller_tests {
         )
         .unwrap();
 
+        let unrelated_path = fixture.0.join("unrelated");
+        git_output(
+            &fixture.0,
+            &[
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                "--",
+                repo.to_str().unwrap(),
+                unrelated_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let unrelated = SourceSpec {
+            repository: unrelated_path.canonicalize().unwrap().display().to_string(),
+            reference: "HEAD".into(),
+            mode: SourceMode::Local,
+        };
+
         let path = fixture.0.join("manual.nix");
         let manual = format!(
             "{{ inputs }}: {{ modules = [ {{ _componentPath = {}; home.keepThis = true; }} {{ home.legacy = true; }} ]; }}",
@@ -918,13 +1552,13 @@ mod controller_tests {
         );
         fs::write(&path, &manual).unwrap();
         let spec = SourceSpec {
-            repository: repo.to_str().unwrap().into(),
+            repository: repo.canonicalize().unwrap().display().to_string(),
             reference: "HEAD".into(),
             mode: SourceMode::Local,
         };
         let mut state = Session::new(
             Mode::Configure,
-            vec![spec.clone()],
+            vec![unrelated.clone()],
             default_request(),
             String::new(),
             path.to_str().unwrap().into(),
@@ -932,8 +1566,10 @@ mod controller_tests {
         let state_directory = fixture.0.join("state");
         let mut editor = controller(&state_directory);
         editor.refresh(&mut state, false).unwrap();
-        assert!(state.modules[0].selected);
-        assert!(state.modules[0].values.is_empty());
+        assert_eq!(state.repositories, vec![unrelated.clone(), spec.clone()]);
+        assert!(!state.modules[0].selected);
+        assert!(state.modules[1].selected);
+        assert!(state.modules[1].values.is_empty());
         editor.save(&mut state).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), manual);
         assert!(!path.with_extension("pre-installer.nix").exists());
@@ -950,7 +1586,7 @@ mod controller_tests {
             ],
         )
         .unwrap();
-        let remote = CatalogSource {
+        let mut remote = CatalogSource {
             spec: SourceSpec {
                 repository: "https://example.invalid/owner/catalog.git".into(),
                 reference: "main".into(),
@@ -958,22 +1594,42 @@ mod controller_tests {
             },
             checkout: fixture.0.join("different-cached-repository"),
             revision: git_output(&repo, &["rev-parse", "HEAD"]),
-            modules: vec![state.modules[0].module.clone()],
+            modules: vec![state.modules[1].module.clone()],
         };
+        let path_names = [definition.display().to_string()];
+        let rows = &state.modules;
         assert_eq!(
-            manual_matches(
-                &path,
-                &[definition.display().to_string()],
-                &[remote],
-                &state.modules
-            )
-            .len(),
+            manual_matches(&path, &path_names, &[remote.clone()], &rows[..1]).len(),
             1
         );
+        assert!(
+            manual_matches(
+                &path,
+                &path_names,
+                &[remote.clone(), editor.sources[1].clone()],
+                rows
+            )
+            .contains_key(&(1, "demo".into()))
+        );
+        remote.spec.reference = "1234567890123456789012345678901234567890".into();
+        remote.revision = Some(remote.spec.reference.clone());
+        let mut pinned_sources = vec![remote.spec.clone()];
+        add_manual_sources(&path_names, &mut pinned_sources);
+        assert_eq!(pinned_sources, vec![remote.spec.clone(), spec.clone()]);
+        let result = manual_matches(
+            &path,
+            &path_names,
+            &[remote, editor.sources[1].clone()],
+            rows,
+        );
+        assert_eq!(
+            result.keys().cloned().collect::<Vec<_>>(),
+            vec![(1, "demo".into())]
+        );
 
-        state.modules[0].selected = false;
+        state.modules[1].selected = false;
         editor.refresh(&mut state, false).unwrap();
-        assert!(!state.modules[0].selected);
+        assert!(!state.modules[1].selected);
         editor.save(&mut state).unwrap();
         let managed = fs::read_to_string(&path).unwrap();
 
@@ -986,8 +1642,8 @@ mod controller_tests {
         );
         let mut reload = controller(&state_directory);
         reload.refresh(&mut restored, false).unwrap();
-        assert_eq!(restored.repositories, vec![spec]);
-        assert!(!restored.modules[0].selected);
+        assert_eq!(restored.repositories, vec![unrelated, spec]);
+        assert!(restored.modules.iter().all(|row| !row.selected));
         reload.save(&mut restored).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), managed);
         assert_eq!(

@@ -5,10 +5,10 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions, Permissions},
-    io::{self, Write},
+    io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, chown},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -169,7 +169,7 @@ pub struct Selected {
     pub values: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum Base {
     Original,
     Fresh {
@@ -338,6 +338,65 @@ pub struct Selector {
     record: Option<Record>,
 }
 
+pub const INSTALLED_SELECTOR: &str = "/etc/nixos/config.nix";
+pub const SAVE_INSTALLED_ARG: &str = "--save-installed-selector";
+const MAX_INSTALLED_EDIT: u64 = 16 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct InstalledEdit {
+    expected: String,
+    record: Record,
+}
+
+impl InstalledEdit {
+    fn write(&self, selector: &Selector) -> Result<()> {
+        if selector.file.bytes != self.expected.as_bytes() {
+            return Err(format!(
+                "{} changed after the catalog was loaded. Refresh it before saving.",
+                selector.path.display()
+            ));
+        }
+        if !matches!(self.record.base, Base::Fresh { .. })
+            || selector.record.as_ref().map(|record| &record.base) != Some(&self.record.base)
+            || self.record.changes != "[]"
+            || !self.record.masked.is_empty()
+        {
+            return Err(
+                "The installed selector's host settings cannot be changed by this operation."
+                    .into(),
+            );
+        }
+        let text = render(&selector.path, &self.record)?;
+        if text.as_bytes() == selector.file.bytes {
+            return Ok(());
+        }
+        write_atomic(
+            &selector.path,
+            text.as_bytes(),
+            selector.file.mode,
+            Some(&selector.file),
+            false,
+        )
+    }
+}
+
+pub fn save_installed_from_stdin() -> Result<()> {
+    let mut bytes = Vec::new();
+    io::stdin()
+        .take(MAX_INSTALLED_EDIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Reading installed selector update: {error}"))?;
+    if bytes.len() as u64 > MAX_INSTALLED_EDIT {
+        return Err("Installed selector update is too large.".into());
+    }
+    let edit: InstalledEdit = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Invalid installed selector update: {error}"))?;
+    let selector = Selector::read(Path::new(INSTALLED_SELECTOR))?
+        .filter(Selector::installed)
+        .ok_or("Expected a root-owned, installer-managed /etc/nixos/config.nix.")?;
+    edit.write(&selector)
+}
+
 impl Selector {
     pub fn read(path: &Path) -> Result<Option<Self>> {
         if !path.is_absolute() {
@@ -458,6 +517,87 @@ impl Selector {
                 quote(path),
             ),
         )
+    }
+
+    pub fn installed(&self) -> bool {
+        cfg!(target_os = "linux")
+            && self.path == Path::new(INSTALLED_SELECTOR)
+            && self.file.owner == 0
+            && self.file.mode & 0o022 == 0
+            && self.path.parent().is_some_and(|directory| {
+                fs::symlink_metadata(directory)
+                    .is_ok_and(|stat| stat.is_dir() && stat.uid() == 0 && stat.mode() & 0o022 == 0)
+            })
+            && self
+                .record
+                .as_ref()
+                .is_some_and(|record| matches!(record.base, Base::Fresh { .. }))
+    }
+
+    pub fn save_installed_with_sudo(
+        &self,
+        modules: String,
+        selected: Vec<Selected>,
+        repositories: Vec<SourceSpec>,
+    ) -> Result<()> {
+        if !self.installed() {
+            return Err(
+                "Only the installer-managed /etc/nixos/config.nix supports this operation.".into(),
+            );
+        }
+        self.file.matches(&self.path)?;
+        let base = self
+            .record
+            .as_ref()
+            .ok_or("Missing installed selector metadata.")?
+            .base
+            .clone();
+        let record = Record {
+            base,
+            modules,
+            selected,
+            repositories,
+            changes: "[]".into(),
+            masked: BTreeSet::new(),
+        };
+        if render(&self.path, &record)?.as_bytes() == self.file.bytes {
+            return Ok(());
+        }
+        let expected =
+            String::from_utf8(self.file.bytes.clone()).map_err(|error| error.to_string())?;
+        let edit = serde_json::to_vec(&InstalledEdit { expected, record })
+            .map_err(|error| error.to_string())?;
+        if edit.len() as u64 > MAX_INSTALLED_EDIT {
+            return Err("Installed selector update is too large.".into());
+        }
+        let executable =
+            std::env::current_exe().map_err(|error| format!("Locating the installer: {error}"))?;
+        let sudo = ["/run/wrappers/bin/sudo", "/usr/bin/sudo"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .ok_or("Saving /etc/nixos/config.nix requires administrator access through sudo.")?;
+        let mut child = Command::new(sudo)
+            .env_clear()
+            .arg("--")
+            .arg(executable)
+            .arg(SAVE_INSTALLED_ARG)
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("Starting sudo to save the installed selector: {error}"))?;
+        let write = child
+            .stdin
+            .take()
+            .ok_or("Cannot send the selector update to sudo.")?
+            .write_all(&edit);
+        let status = child
+            .wait()
+            .map_err(|error| format!("Waiting for the selector update: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "The administrator save of /etc/nixos/config.nix exited with {status}."
+            ));
+        }
+        write.map_err(|error| format!("Sending the installed selector update: {error}"))
     }
 
     pub fn save(
@@ -641,6 +781,14 @@ enum HostPlatform {
 }
 
 impl HostPlatform {
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Darwin
+        } else {
+            Self::Linux
+        }
+    }
+
     fn outputs(self) -> &'static str {
         match self {
             Self::Linux => "nixosConfigurations",
@@ -707,15 +855,23 @@ pub struct RebuildTarget {
 
 impl RebuildTarget {
     pub fn resolve(flake: &str, selector: &Path) -> Result<Self> {
-        let platform = if cfg!(target_os = "macos") {
-            HostPlatform::Darwin
-        } else {
-            HostPlatform::Linux
-        };
-        Self::resolve_for(flake, selector, platform)
+        Self::resolve_for(flake, selector, HostPlatform::current())
+    }
+
+    pub fn validate_selector(flake: &str, selector: &Path) -> Result<()> {
+        Self::inspect(flake, selector, HostPlatform::current(), true).map(|_| ())
     }
 
     fn resolve_for(flake: &str, selector: &Path, platform: HostPlatform) -> Result<Self> {
+        Self::inspect(flake, selector, platform, false)
+    }
+
+    fn inspect(
+        flake: &str,
+        selector: &Path,
+        platform: HostPlatform,
+        validate_modules: bool,
+    ) -> Result<Self> {
         let (reference, explicit) = flake
             .split_once('#')
             .map_or((flake, None), |(reference, name)| (reference, Some(name)));
@@ -725,10 +881,15 @@ impl RebuildTarget {
         let reference = nix_flake_reference(reference);
         let path = selector.to_str().ok_or("Selector path must be UTF-8")?;
         let outputs = platform.outputs();
+        let modules_check = if validate_modules {
+            r#"if !(builtins.isList (cfg.modules or null) && builtins.all builtins.isAttrs cfg.modules) then throw "config.nix must declare modules as a list of module bundles" else "#
+        } else {
+            ""
+        };
         let data: FlakeOutputs = nix_json(
             selector,
             &format!(
-                "let flake = builtins.getFlake {}; cfg = import (builtins.toPath {}) {{ inputs = flake.inputs // {{ self = flake; }}; }}; in {{ names = builtins.attrNames (flake.{outputs} or {{}}); username = cfg.username or null; hostname = cfg.hostName or null; }}",
+                "let flake = builtins.getFlake {}; cfg = import (builtins.toPath {}) {{ inputs = flake.inputs // {{ self = flake; }}; }}; in {modules_check}{{ names = builtins.attrNames (flake.{outputs} or {{}}); username = cfg.username or null; hostname = cfg.hostName or null; }}",
                 quote(&reference),
                 quote(path),
             ),
@@ -941,6 +1102,60 @@ mod selector_tests {
         fs::write(&selector, "{...}: { hostName = \"machine\"; }").unwrap();
         let fresh = RebuildTarget::resolve_for(&flake, &selector, HostPlatform::Linux).unwrap();
         assert_eq!(fresh.name, "machine");
+    }
+
+    #[test]
+    fn scoped_installed_edit_preserves_host_permissions_and_rejects_stale_input() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.nix");
+        create_selector(
+            &path,
+            "[]".into(),
+            vec![],
+            vec![],
+            "alice",
+            "machine",
+            "x86_64-linux",
+        )
+        .unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
+        let fresh = Selector::read(&path).unwrap().unwrap();
+        let expected = fs::read_to_string(&path).unwrap();
+        let mut record = fresh.record.as_ref().unwrap().clone();
+        record.modules = "[ { home.test = true; } ]".into();
+
+        let mut wrong_record = record.clone();
+        wrong_record.base = Base::Fresh {
+            username: "other-user".into(),
+            hostname: "machine".into(),
+            system: "x86_64-linux".into(),
+        };
+        assert!(
+            InstalledEdit {
+                expected: expected.clone(),
+                record: wrong_record
+            }
+            .write(&fresh)
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+
+        let update = InstalledEdit { expected, record };
+        update.write(&fresh).unwrap();
+        let saved = Selector::read(&path).unwrap().unwrap();
+        assert_eq!(
+            saved.record.as_ref().unwrap().modules,
+            "[ { home.test = true; } ]"
+        );
+        assert_eq!(saved.file.mode, 0o640);
+        assert_eq!(saved.file.owner, fresh.file.owner);
+        assert_eq!(saved.file.group, fresh.file.group);
+        assert!(update.write(&saved).is_err());
+        assert!(!backup_path(&path).exists());
+        assert!(
+            !saved.installed(),
+            "only the real system path permits elevation"
+        );
     }
 
     #[test]

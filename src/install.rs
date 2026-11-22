@@ -1,4 +1,5 @@
 //! NixOS live-system installation. Planning inspects disks and never modifies them.
+mod inplace;
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -16,6 +17,20 @@ const TARGET: &str = "/mnt";
 const EFI_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 const LINUX_GUID: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
 const BIOS_GUID: &str = "21686148-6449-6e6f-744e-656564454649";
+
+pub fn suggested_account() -> Option<String> {
+    inplace::suggested_account()
+}
+
+pub fn default_install_layout() -> DiskLayout {
+    if inplace::is_installed_linux_root() {
+        DiskLayout::InPlace
+    } else {
+        DiskLayout::Mounted {
+            target: PathBuf::from(TARGET),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct BlockDevice {
@@ -68,6 +83,7 @@ pub enum DiskLayout {
     Mounted {
         target: PathBuf,
     },
+    InPlace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +150,8 @@ struct CheckedTarget {
     esp: Option<DeviceIdentity>,
     mounts: Vec<Mount>,
     alongside: Option<AlongsidePlan>,
+    in_place: Option<inplace::Account>,
+    bios_entry: Option<inplace::BiosEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -272,6 +290,7 @@ pub fn confirmation_token(plan: &InstallPlan) -> String {
             }
         }
         DiskLayout::Mounted { target } => format!("INSTALL {}", target.display()),
+        DiskLayout::InPlace => "INSTALL IN PLACE /".into(),
     }
 }
 
@@ -379,10 +398,13 @@ fn inspect_target(
         esp: None,
         mounts: Vec::new(),
         alongside: None,
+        in_place: None,
+        bios_entry: None,
     };
     let required_root_size = ROOT_MINIMUM + u64::from(request.swap_gib) * GIB;
 
     match &request.layout {
+        DiskLayout::InPlace => inplace::inspect(request, devices, current_mounts, &mut checked)?,
         DiskLayout::Erase { disk } => {
             let device = lookup(devices, disk)?;
             require_kind(device, "disk")?;
@@ -1082,6 +1104,7 @@ fn decode_mount_path(value: &str) -> Result<PathBuf, String> {
 fn describe_steps(request: &InstallRequest, checked: &CheckedTarget) -> Vec<String> {
     let mut steps = Vec::new();
     match &request.layout {
+        DiskLayout::InPlace => return inplace::describe(request, checked),
         DiskLayout::Erase { disk } => {
             steps.push(format!("Erase all filesystems and partitions on {disk}."));
             steps.push(match request.boot_mode {
@@ -1209,7 +1232,7 @@ pub fn apply_plan(
     let request = &plan.approved_request;
     validate_settings(request)?;
     preflight(request)?;
-    let state_version = state_version()?;
+    let state_version = "26.05";
     let checked = inspect_target(request, &probe()?, &mounts()?)?;
     if checked != plan.checked {
         return Err(
@@ -1217,8 +1240,12 @@ pub fn apply_plan(
         );
     }
 
+    if matches!(request.layout, DiskLayout::InPlace) {
+        return inplace::apply(request, &checked, state_version, configure);
+    }
+
     let mut session = InstallMounts::default();
-    let result = install(request, &checked, &state_version, &mut session, configure);
+    let result = install(request, &checked, state_version, &mut session, configure);
     let cleanup = session.clean();
     match (result, cleanup) {
         (Ok(()), clean) => clean,
@@ -1239,11 +1266,21 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
     {
         return Err("The UEFI variable filesystem must be mounted and writable before installing systemd-boot.".into());
     }
+    if matches!(request.layout, DiskLayout::InPlace) {
+        return tools_available(&[
+            "nixos-generate-config",
+            "nix",
+            "nix-env",
+            "lsblk",
+            "getent",
+            "df",
+            "mkpasswd",
+        ]);
+    }
     let mut tools = vec![
         "nixos-generate-config",
         "nixos-install",
         "nixos-enter",
-        "nixos-version",
         "lsblk",
     ];
     match &request.layout {
@@ -1285,6 +1322,7 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
             }
         }
         DiskLayout::Mounted { .. } => {}
+        DiskLayout::InPlace => unreachable!("in-place preflight handled separately"),
     }
     if request.encrypt {
         tools.push("cryptsetup");
@@ -1337,6 +1375,7 @@ fn install(
             ..
         } => (format_root, format_esp),
         DiskLayout::Mounted { .. } => (false, false),
+        DiskLayout::InPlace => unreachable!("in-place apply handled separately"),
     };
 
     if !matches!(request.layout, DiskLayout::Mounted { .. }) {
@@ -1871,7 +1910,10 @@ fn configuration(
     boot_disk: Option<&str>,
     state_version: &str,
 ) -> Result<String, String> {
-    let boot = match request.boot_mode {
+    let boot = if matches!(request.layout, DiskLayout::InPlace) {
+        String::new()
+    } else {
+        match request.boot_mode {
         BootMode::Uefi if shared_esp(request) => {
             let bootloader_id = efi_id(&request.hostname);
             format!("  boot.loader.systemd-boot.enable = lib.mkForce false;\n  boot.loader.grub.enable = lib.mkForce true;\n  boot.loader.grub.efiSupport = lib.mkForce true;\n  boot.loader.grub.efiInstallAsRemovable = lib.mkForce false;\n  boot.loader.grub.devices = lib.mkForce [];\n  boot.loader.grub.mirroredBoots = lib.mkForce [ {{ path = \"/boot\"; devices = [ \"nodev\" ]; efiBootloaderId = \"{bootloader_id}\"; }} ];\n  boot.loader.efi.canTouchEfiVariables = true;\n")
@@ -1881,6 +1923,7 @@ fn configuration(
             let disk = boot_disk.ok_or("The BIOS boot disk was not validated.")?;
             format!("  boot.loader.systemd-boot.enable = lib.mkForce false;\n  boot.loader.grub.enable = lib.mkForce true;\n  boot.loader.grub.efiSupport = lib.mkForce false;\n  boot.loader.grub.devices = lib.mkForce [ \"{disk}\" ];\n")
         }
+    }
     };
     let desktop = desktop_lines(request.desktop.as_deref())?;
     let swap = if request.swap_gib > 0 {
@@ -1903,24 +1946,6 @@ fn configuration(
         request.keymap,
         request.username
     ))
-}
-
-fn state_version() -> Result<String, String> {
-    let raw = capture("nixos-version", std::iter::empty::<&str>())?;
-    let output = std::str::from_utf8(&raw).map_err(|_| "Invalid nixos-version output.")?;
-    let mut parts = output.trim().split('.');
-    let major = parts.next().ok_or("Missing live NixOS version.")?;
-    let minor = parts.next().ok_or("Missing live NixOS minor version.")?;
-    if [major, minor]
-        .into_iter()
-        .any(|part| part.len() != 2 || !part.bytes().all(|c| c.is_ascii_digit()))
-    {
-        return Err(format!(
-            "Unrecognized live NixOS version: {}",
-            output.trim()
-        ));
-    }
-    Ok(format!("{major}.{minor}"))
 }
 
 fn require_root() -> Result<(), String> {
@@ -2030,6 +2055,8 @@ mod tests {
             esp: None,
             mounts: Vec::new(),
             alongside: None,
+            in_place: None,
+            bios_entry: None,
         };
         InstallPlan {
             approved_request: request.clone(),

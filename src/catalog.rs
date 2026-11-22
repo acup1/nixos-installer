@@ -70,6 +70,8 @@ pub enum OptionKind {
 #[serde(deny_unknown_fields)]
 pub struct ManifestOption {
     pub layer: Layer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<Platform>>,
     pub path: Vec<String>,
     pub title: String,
     pub description: String,
@@ -162,6 +164,15 @@ impl Manifest {
                 || !option.path.iter().all(|segment| valid_segment(segment))
             {
                 return Err(format!("Неверный путь параметра {:?}", option.path));
+            }
+            if let Some(platforms) = &option.platforms
+                && (platforms.is_empty()
+                    || platforms.iter().collect::<BTreeSet<_>>().len() != platforms.len()
+                    || !platforms
+                        .iter()
+                        .all(|p| self.layers[&option.layer].contains(p)))
+            {
+                return Err(format!("Неверные платформы параметра {:?}", option.path));
             }
             if !paths.insert((option.layer, &option.path))
                 || !keys.insert((option.layer, option.path.join(".")))

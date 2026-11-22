@@ -119,7 +119,9 @@ impl Page {
     fn subtitle(self) -> &'static str {
         match self {
             Self::Sources => "Add local or Git module repositories, then load their catalog.",
-            Self::Modules => "Toggle components and edit their Nixpkgs package lists.",
+            Self::Modules => {
+                "Space toggles modules, packages and switches. Ctrl+R restores a switch's default."
+            }
             Self::System => "Set the hostname, user and desktop for the new system.",
             Self::Storage => "Choose how to prepare or reuse the target filesystem.",
             Self::Review => "Check the selected modules and changes before applying.",
@@ -179,6 +181,8 @@ enum DeviceSlot {
 enum Control {
     Edit(Field),
     SelectModule(usize),
+    ToggleParameter(usize, Vec<usize>),
+    ResetPackages(usize, usize),
     AddRepository,
     ToggleSource(usize),
     RemoveRepository(usize),
@@ -584,25 +588,7 @@ impl Ui {
                     }
                     rows.push(Row::action(title, Control::SelectModule(index)));
                     if row.selected {
-                        for (parameter, option) in module.manifest.options.iter().enumerate() {
-                            if !module.manifest.layers[&option.layer].contains(&platform) {
-                                continue;
-                            }
-                            let saved = row.values.get(&option_key(option));
-                            let value = saved
-                                .or(option.default.as_ref())
-                                .map(|value| option_text(option.kind, value));
-                            let display = match (saved, value) {
-                                (Some(_), Some(value)) => value,
-                                (None, Some(value)) => format!("{value} (default)"),
-                                _ => "Default".into(),
-                            };
-                            rows.push(Row::field(
-                                &format!("  {} · {}", layer_name(option.layer), option.title),
-                                &display,
-                                Field::Parameter(index, parameter),
-                            ));
-                        }
+                        rows.extend(parameter_rows(index, row, platform));
                     }
                 }
                 if !found {
@@ -653,6 +639,7 @@ impl Ui {
             DiskLayout::Alongside { .. } => "Install in unallocated space",
             DiskLayout::Partitions { .. } => "Use existing partitions",
             DiskLayout::Mounted { .. } => "Use a mounted target",
+            DiskLayout::InPlace => "Convert this Linux installation to NixOS",
         };
         let mut rows = vec![
             Row::action(
@@ -662,6 +649,12 @@ impl Ui {
             Row::action("Refresh disk list", Control::Send(Action::RefreshDisks)),
         ];
         match &request.layout {
+            DiskLayout::InPlace => {
+                rows.push(Row::note(
+                    "Reuse the current root filesystem (/). The next boot starts NixOS.",
+                ));
+                rows.push(Row::note("Review the boot changes and the previous system's /old-root location before applying."));
+            }
             DiskLayout::Erase { disk } => rows.push(Row::action(
                 format!("Target disk        {}", partition_name(disk)),
                 Control::Choose(DeviceSlot::Disk),
@@ -729,7 +722,12 @@ impl Ui {
                 Field::Target,
             )),
         }
-        rows.push(if matches!(request.layout, DiskLayout::Alongside { .. }) {
+        rows.push(if matches!(request.layout, DiskLayout::InPlace) {
+            Row::note(format!(
+                "Boot mode          {} (current system)",
+                boot_name(&request.boot_mode)
+            ))
+        } else if matches!(request.layout, DiskLayout::Alongside { .. }) {
             Row::note("Boot mode          UEFI (required for this layout)")
         } else {
             Row::action(
@@ -737,7 +735,10 @@ impl Ui {
                 Control::Change(Setting::Boot),
             )
         });
-        if !matches!(request.layout, DiskLayout::Mounted { .. }) {
+        if !matches!(
+            request.layout,
+            DiskLayout::Mounted { .. } | DiskLayout::InPlace
+        ) {
             rows.push(Row::action(
                 format!(
                     "Filesystem         {}",
@@ -755,10 +756,12 @@ impl Ui {
                 Field::Swap,
             ));
         }
-        rows.push(Row::action(
-            "Edit disk partitions (cfdisk)",
-            Control::Choose(DeviceSlot::PartitionEditor),
-        ));
+        if request.layout != DiskLayout::InPlace {
+            rows.push(Row::action(
+                "Edit disk partitions (cfdisk)",
+                Control::Choose(DeviceSlot::PartitionEditor),
+            ));
+        }
         rows
     }
 
@@ -826,7 +829,11 @@ impl Ui {
                     state.install.username,
                     state.install.hostname,
                     boot_name(&state.install.boot_mode),
-                    filesystem_name(&state.install.filesystem)
+                    if state.install.layout == DiskLayout::InPlace {
+                        "existing root filesystem"
+                    } else {
+                        filesystem_name(&state.install.filesystem)
+                    }
                 )));
                 if self.applied {
                     rows.insert(0, Row::note("Installation completed."));
@@ -904,6 +911,20 @@ impl Ui {
             }
             Event::Key(KEY_DOWN | KEY_RIGHT | 9) => {
                 self.move_focus(&rows, true);
+                Outcome::Continue
+            }
+            Event::Key(18) => {
+                if let Some(Control::ToggleParameter(row, parameters)) =
+                    rows.get(self.focus).and_then(|r| r.control.as_ref())
+                {
+                    let module = &mut state.modules[*row];
+                    for &parameter in parameters {
+                        module
+                            .values
+                            .remove(&option_key(&module.module.manifest.options[parameter]));
+                    }
+                    state.plan = None;
+                }
                 Outcome::Continue
             }
             Event::Key(10 | 13) => self.activate(
@@ -984,6 +1005,28 @@ impl Ui {
             }
             Some(Control::SelectModule(index)) => {
                 state.modules[index].selected = !state.modules[index].selected;
+                state.plan = None;
+            }
+            Some(Control::ToggleParameter(row, parameters)) => {
+                let module = &mut state.modules[row];
+                let enabled = !parameters.iter().all(|&i| module.boolean(i) == Some(true));
+                for parameter in parameters {
+                    let option = &module.module.manifest.options[parameter];
+                    let key = option_key(option);
+                    // Returning to the default lets subsequent catalog updates take effect.
+                    if option.default.as_ref().and_then(Value::as_bool) == Some(enabled) {
+                        module.values.remove(&key);
+                    } else {
+                        module.values.insert(key, Value::Bool(enabled));
+                    }
+                }
+                state.plan = None;
+            }
+            Some(Control::ResetPackages(row, parameter)) => {
+                let module = &mut state.modules[row];
+                module
+                    .values
+                    .remove(&option_key(&module.module.manifest.options[parameter]));
                 state.plan = None;
             }
             Some(Control::AddRepository) => {
@@ -1387,7 +1430,16 @@ fn change_setting(request: &mut InstallRequest, setting: Setting) {
                 DiskLayout::Partitions { .. } => DiskLayout::Mounted {
                     target: PathBuf::from("/mnt"),
                 },
-                DiskLayout::Mounted { .. } => DiskLayout::Erase {
+                DiskLayout::Mounted { .. } => {
+                    request.boot_mode = if std::path::Path::new("/sys/firmware/efi").is_dir() {
+                        BootMode::Uefi
+                    } else {
+                        BootMode::Bios
+                    };
+                    request.swap_gib = 0;
+                    DiskLayout::InPlace
+                }
+                DiskLayout::InPlace => DiskLayout::Erase {
                     disk: String::new(),
                 },
             };
@@ -1991,6 +2043,89 @@ pub fn option_key(option: &ManifestOption) -> String {
     format!("{}.{}", layer_name(option.layer), option.path.join("."))
 }
 
+impl ModuleRow {
+    fn boolean(&self, index: usize) -> Option<bool> {
+        let option = &self.module.manifest.options[index];
+        self.values
+            .get(&option_key(option))
+            .or(option.default.as_ref())
+            .and_then(Value::as_bool)
+    }
+}
+
+fn parameter_rows(index: usize, row: &ModuleRow, platform: Platform) -> Vec<Row> {
+    let manifest = &row.module.manifest;
+    let visible = manifest.options.iter().enumerate().filter(|(_, option)| {
+        option
+            .platforms
+            .as_ref()
+            .unwrap_or(&manifest.layers[&option.layer])
+            .contains(&platform)
+    });
+    // A system service and its Home Manager configuration share one package switch.
+    let mut packages = BTreeMap::<&[String], Vec<usize>>::new();
+    for (i, option) in visible.clone() {
+        if is_package_switch(option) {
+            packages.entry(&option.path).or_default().push(i);
+        }
+    }
+    let mut rows = Vec::new();
+    for (i, option) in visible {
+        let saved = row.values.get(&option_key(option));
+        let label = format!("{} · {}", layer_name(option.layer), option.title);
+        if option.kind == OptionKind::Packages {
+            if saved.is_some() {
+                rows.push(Row::action(
+                    format!(
+                        "  {} · Restore module packages (legacy replacement active)",
+                        layer_name(option.layer)
+                    ),
+                    Control::ResetPackages(index, i),
+                ));
+            }
+            continue;
+        }
+        if option.kind == OptionKind::Bool {
+            let (targets, label) = if is_package_switch(option) {
+                let Some(targets) = packages.remove(option.path.as_slice()) else {
+                    continue;
+                };
+                (targets, option.title.as_str())
+            } else {
+                (vec![i], label.as_str())
+            };
+            let mark = if targets.iter().all(|&i| row.boolean(i) == Some(true)) {
+                "[×]"
+            } else if targets.iter().all(|&i| row.boolean(i) == Some(false)) {
+                "[ ]"
+            } else {
+                "[–]"
+            };
+            rows.push(Row::action(
+                format!("  {mark} {label}"),
+                Control::ToggleParameter(index, targets),
+            ));
+        } else {
+            let display = match (saved, &option.default) {
+                (Some(v), _) => option_text(option.kind, v),
+                (None, Some(v)) => format!("{} (default)", option_text(option.kind, v)),
+                _ => "Default".into(),
+            };
+            rows.push(Row::field(
+                &format!("  {label}"),
+                &display,
+                Field::Parameter(index, i),
+            ));
+        }
+    }
+    rows
+}
+
+fn is_package_switch(option: &ManifestOption) -> bool {
+    option.kind == OptionKind::Bool
+        && matches!(option.path.as_slice(), [root, _, group, _] if root == "components" && group == "enabledPackages")
+}
+
 fn target_platform(mode: Mode) -> Platform {
     if mode == Mode::Install || !cfg!(target_os = "macos") {
         Platform::Linux
@@ -2008,11 +2143,11 @@ fn source_mode(mode: SourceMode) -> &'static str {
 
 fn option_hint(kind: OptionKind) -> &'static str {
     match kind {
-        OptionKind::Bool => "true or false",
+        OptionKind::Bool => "Toggle this switch on the Modules page",
         OptionKind::Integer => "Whole number",
         OptionKind::String => "Text",
         OptionKind::StringList => "JSON string list",
-        OptionKind::Packages => "Package names separated by commas",
+        OptionKind::Packages => "Restore the module packages on the Modules page",
     }
 }
 
@@ -2033,17 +2168,10 @@ fn option_text(kind: OptionKind, value: &Value) -> String {
 fn parse_option(kind: OptionKind, input: &str) -> Result<Value, String> {
     let error = || format!("Expected {}.", option_hint(kind));
     let value = match kind {
-        OptionKind::Bool => Value::Bool(input.parse().map_err(|_| error())?),
+        OptionKind::Bool | OptionKind::Packages => return Err(option_hint(kind).into()),
         OptionKind::Integer => Value::from(input.parse::<i64>().map_err(|_| error())?),
         OptionKind::String => Value::String(input.to_owned()),
         OptionKind::StringList => serde_json::from_str(input).map_err(|_| error())?,
-        OptionKind::Packages => Value::Array(
-            input
-                .split(|ch: char| ch == ',' || ch.is_whitespace())
-                .filter(|name| !name.is_empty())
-                .map(|name| Value::String(name.to_owned()))
-                .collect(),
-        ),
     };
     if kind.accepts(&value) {
         Ok(value)
@@ -2229,11 +2357,12 @@ mod tests {
                     layers: BTreeMap::from([(Layer::Home, vec![target_platform(state.mode)])]),
                     options: vec![ManifestOption {
                         layer: Layer::Home,
-                        path: vec!["example".into(), "packages".into()],
-                        title: "Packages".into(),
-                        description: "Packages".into(),
-                        kind: OptionKind::Packages,
-                        default: Some(json!(["jq"])),
+                        platforms: None,
+                        path: vec!["example".into(), "port".into()],
+                        title: "Port".into(),
+                        description: "Service port".into(),
+                        kind: OptionKind::Integer,
+                        default: Some(json!(5001)),
                     }],
                 },
             },
@@ -2243,20 +2372,134 @@ mod tests {
             ui.set_field(&mut state, Field::Parameter(0, 0), "hello; abort")
                 .is_err()
         );
-        ui.set_field(
-            &mut state,
-            Field::Parameter(0, 0),
-            "ripgrep, nerd-fonts.jetbrains-mono",
-        )
-        .unwrap();
-        assert_eq!(
-            state.modules[0].values["home.example.packages"],
-            json!(["ripgrep", "nerd-fonts.jetbrains-mono"])
-        );
+        ui.set_field(&mut state, Field::Parameter(0, 0), "6001")
+            .unwrap();
+        assert_eq!(state.modules[0].values["home.example.port"], json!(6001));
         ui.activate(&mut state, Some(Control::Edit(Field::Parameter(0, 0))));
         ui.event(&mut state, Event::Key(18));
         assert!(state.modules[0].values.is_empty());
-        assert_eq!(ui.field(&state, Field::Parameter(0, 0)), "jq");
+        assert_eq!(ui.field(&state, Field::Parameter(0, 0)), "5001");
+    }
+
+    #[test]
+    fn legacy_package_override_is_preserved_until_reset() {
+        let mut state = session();
+        let platform = target_platform(state.mode);
+        let option = serde_json::from_value(json!({"layer":"home","path":["example","packages"],
+            "title":"Packages","description":"Previous package list","type":"packages"}))
+        .unwrap();
+        let row = ModuleRow {
+            repository: 0,
+            selected: true,
+            values: BTreeMap::from([("home.example.packages".into(), json!(["jq"]))]),
+            module: CatalogModule {
+                path: "sample".into(),
+                manifest: Manifest {
+                    schema_version: 1,
+                    title: "Sample".into(),
+                    description: "Sample".into(),
+                    layers: BTreeMap::from([(Layer::Home, vec![platform])]),
+                    options: vec![option],
+                },
+            },
+        };
+        state.modules.push(row);
+        let mut ui = Ui {
+            page: 1,
+            ..Ui::default()
+        };
+        ui.focus = ui
+            .rows(&state)
+            .iter()
+            .position(|r| matches!(r.control, Some(Control::ResetPackages(..))))
+            .unwrap();
+        ui.event(&mut state, Event::Key(13));
+        assert!(ui.modal.is_none());
+        assert!(state.modules[0].values.is_empty());
+        assert!(parameter_rows(0, &state.modules[0], platform).is_empty());
+    }
+
+    #[test]
+    fn package_switch_toggles_visible_layers_together_without_an_editor() {
+        let mut state = session();
+        let platform = target_platform(state.mode);
+        let system_layer = if platform == Platform::Darwin {
+            Layer::Darwin
+        } else {
+            Layer::Nixos
+        };
+        let mut package: ManifestOption = serde_json::from_value(json!({
+            "layer":"home", "path":["components","sample","enabledPackages","daemon"],
+            "type":"bool", "title":"Daemon", "description":"Daemon and its service", "default":true
+        }))
+        .unwrap();
+        let mut options = vec![package.clone()];
+        package.layer = system_layer;
+        options.push(package);
+        options.push(
+            serde_json::from_value(json!({"layer":"home","path":["signal"],"title":"Signal",
+            "description":"Signal", "type":"bool", "default":false}))
+            .unwrap(),
+        );
+        state.modules.push(ModuleRow {
+            repository: 0,
+            selected: true,
+            values: BTreeMap::new(),
+            module: CatalogModule {
+                path: "sample".into(),
+                manifest: Manifest {
+                    schema_version: 1,
+                    title: "Sample".into(),
+                    description: "Sample".into(),
+                    layers: BTreeMap::from([
+                        (Layer::Home, vec![platform]),
+                        (system_layer, vec![platform]),
+                    ]),
+                    options,
+                },
+            },
+        });
+        let mut ui = Ui {
+            page: 1,
+            ..Ui::default()
+        };
+        let rows = ui.rows(&state);
+        assert_eq!(rows.iter().filter(|r| r.text.contains("Daemon")).count(), 1);
+        ui.focus = rows
+            .iter()
+            .position(|r| r.text.contains("[×] Daemon"))
+            .unwrap();
+        ui.event(&mut state, Event::Text(" ".into()));
+        assert!(ui.modal.is_none());
+        assert_eq!(state.modules[0].values.len(), 2);
+        assert!(
+            state.modules[0]
+                .values
+                .values()
+                .all(|v| v == &Value::Bool(false))
+        );
+        let mut frame = FrameBuffer::new(98, 26);
+        ui.render(&mut frame, &state);
+        let area = ui.hits.iter().find(|(_, i)| *i == ui.focus).unwrap().0;
+        ui.event(
+            &mut state,
+            Event::Mouse(Mouse {
+                x: area.x as u16,
+                y: area.y as u16,
+                event: MouseEvent::LEFT,
+                ..Mouse::default()
+            }),
+        );
+        assert!(state.modules[0].values.is_empty());
+        ui.focus = ui
+            .rows(&state)
+            .iter()
+            .position(|r| r.text.contains("[ ] home · Signal"))
+            .unwrap();
+        ui.event(&mut state, Event::Key(13));
+        assert_eq!(state.modules[0].values["home.signal"], true);
+        ui.event(&mut state, Event::Key(18));
+        assert!(state.modules[0].values.is_empty());
     }
 
     #[test]
