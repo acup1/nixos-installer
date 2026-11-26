@@ -4,7 +4,8 @@ use crate::catalog::{
 };
 use crate::config::{Identity, validate_hostname, validate_username};
 use crate::install::{
-    BlockDevice, BootMode, DiskLayout, FileSystem, InstallPlan, InstallRequest, confirmation_token,
+    BlockDevice, BootMode, DataPartition, DataRole, DiskLayout, FileSystem, InstallPlan,
+    InstallRequest, MAX_DATA_PARTITIONS, confirmation_token, hibernation_swap_gib,
 };
 use crate::read_command::Cancellation;
 use serde_json::Value;
@@ -202,24 +203,30 @@ enum Field {
     Keymap,
     Desktop,
     Swap,
+    PartitionSize(usize),
+    PartitionName(usize),
     Target,
 }
 
 #[derive(Clone, Copy)]
 enum Setting {
-    Layout,
     Boot,
-    Filesystem,
     Encryption,
     Network,
     FormatRoot,
     FormatEsp,
+    FormatSwap,
+    Swap,
+    Hibernate,
+    AddPartition,
+    RemovePartition(usize),
 }
 
 #[derive(Clone, Copy)]
 enum DeviceSlot {
     Disk,
     Root,
+    Swap,
     Esp,
     AlongsideEsp,
     BootDisk,
@@ -238,6 +245,7 @@ enum Control {
     RemoveRepository(usize),
     Change(Setting),
     Choose(DeviceSlot),
+    ChooseStorage(StorageChoice),
     ChooseParameter(usize, usize),
     Page(usize),
     ShowPlan,
@@ -298,6 +306,14 @@ struct Choice {
 enum PickerTarget {
     Device(DeviceSlot),
     Parameter(usize, usize),
+    Storage(StorageChoice),
+}
+
+#[derive(Clone, Copy)]
+enum StorageChoice {
+    Layout,
+    Filesystem(Option<usize>),
+    PartitionRole(usize),
 }
 
 struct Picker {
@@ -673,14 +689,6 @@ fn boot_name(boot: &BootMode) -> &'static str {
     }
 }
 
-fn filesystem_name(filesystem: &FileSystem) -> &'static str {
-    match filesystem {
-        FileSystem::Ext4 => "ext4",
-        FileSystem::Btrfs => "btrfs",
-        FileSystem::Xfs => "XFS",
-    }
-}
-
 fn yes_no(value: bool) -> &'static str {
     if value { "Yes" } else { "No" }
 }
@@ -690,6 +698,31 @@ fn partition_name(value: &str) -> &str {
         "Choose device"
     } else {
         value
+    }
+}
+
+fn checkbox(label: &str, checked: bool, setting: Setting) -> Row {
+    Row::action(
+        format!("[{}] {label}", if checked { 'x' } else { ' ' }),
+        Control::Change(setting),
+    )
+}
+
+const LAYOUTS: [&str; 5] = [
+    "Create a new layout (erase disk)",
+    "Install in unallocated space",
+    "Use existing partitions",
+    "Use a mounted target",
+    "Convert this Linux installation to NixOS",
+];
+
+fn layout_index(layout: &DiskLayout) -> usize {
+    match layout {
+        DiskLayout::Erase { .. } => 0,
+        DiskLayout::Alongside { .. } => 1,
+        DiskLayout::Partitions { .. } => 2,
+        DiskLayout::Mounted { .. } => 3,
+        DiskLayout::InPlace => 4,
     }
 }
 
@@ -897,20 +930,20 @@ impl Ui {
 
     fn storage_rows(&self, state: &Session) -> Vec<Row> {
         let request = &state.install;
-        let layout = match &request.layout {
-            DiskLayout::Erase { .. } => "Erase a disk",
-            DiskLayout::Alongside { .. } => "Install in unallocated space",
-            DiskLayout::Partitions { .. } => "Use existing partitions",
-            DiskLayout::Mounted { .. } => "Use a mounted target",
-            DiskLayout::InPlace => "Convert this Linux installation to NixOS",
-        };
+        let layout = LAYOUTS[layout_index(&request.layout)];
         let mut rows = vec![
             Row::action(
-                format!("Layout             {layout}"),
-                Control::Change(Setting::Layout),
+                format!("Layout             {layout} ▾"),
+                Control::ChooseStorage(StorageChoice::Layout),
             ),
             Row::action("Refresh disk list", Control::Send(Action::RefreshDisks)),
         ];
+        if request.layout != DiskLayout::InPlace {
+            rows.push(Row::action(
+                "Manual partition editor (cfdisk)",
+                Control::Choose(DeviceSlot::PartitionEditor),
+            ));
+        }
         match &request.layout {
             DiskLayout::InPlace => {
                 rows.push(Row::note(
@@ -918,10 +951,23 @@ impl Ui {
                 ));
                 rows.push(Row::note("Review the boot changes and the previous system's /old-root location before applying."));
             }
-            DiskLayout::Erase { disk } => rows.push(Row::action(
-                format!("Target disk        {}", partition_name(disk)),
-                Control::Choose(DeviceSlot::Disk),
-            )),
+            DiskLayout::Erase { disk, .. } => {
+                rows.push(Row::action(
+                    format!("Target disk        {} ▾", partition_name(disk)),
+                    Control::Choose(DeviceSlot::Disk),
+                ));
+                if let Some(device) = state.disks.iter().find(|device| device.path == *disk) {
+                    rows.push(Row::note(format!(
+                        "{} · {:.1} GiB · Confirming installation erases this disk",
+                        device.path,
+                        device.size as f64 / 1073741824.0,
+                    )));
+                }
+                rows.push(Row::note(match request.boot_mode {
+                    BootMode::Uefi => "EFI /boot          FAT32 · 1 GiB · automatic",
+                    BootMode::Bios => "BIOS boot          4 MiB · automatic",
+                }));
+            }
             DiskLayout::Alongside { disk, esp } => {
                 rows.push(Row::note(
                     "Use an existing GPT disk with unallocated space.",
@@ -948,15 +994,13 @@ impl Ui {
                 boot_disk,
                 format_root,
                 format_esp,
+                ..
             } => {
                 rows.push(Row::action(
                     format!("Root partition     {}", partition_name(root)),
                     Control::Choose(DeviceSlot::Root),
                 ));
-                rows.push(Row::action(
-                    format!("Format root        {}", yes_no(*format_root)),
-                    Control::Change(Setting::FormatRoot),
-                ));
+                rows.push(checkbox("Format root", *format_root, Setting::FormatRoot));
                 if matches!(request.boot_mode, BootMode::Uefi) {
                     rows.push(Row::action(
                         format!(
@@ -965,9 +1009,10 @@ impl Ui {
                         ),
                         Control::Choose(DeviceSlot::Esp),
                     ));
-                    rows.push(Row::action(
-                        format!("Format EFI         {}", yes_no(*format_esp)),
-                        Control::Change(Setting::FormatEsp),
+                    rows.push(checkbox(
+                        "Format EFI as FAT32",
+                        *format_esp,
+                        Setting::FormatEsp,
                     ));
                 } else {
                     rows.push(Row::action(
@@ -998,32 +1043,103 @@ impl Ui {
                 Control::Change(Setting::Boot),
             )
         });
-        if !matches!(
-            request.layout,
-            DiskLayout::Mounted { .. } | DiskLayout::InPlace
-        ) {
-            rows.push(Row::action(
-                format!(
-                    "Filesystem         {}",
-                    filesystem_name(&request.filesystem)
-                ),
-                Control::Change(Setting::Filesystem),
-            ));
-            rows.push(Row::action(
-                format!("Encryption         {}", yes_no(request.encrypt)),
-                Control::Change(Setting::Encryption),
-            ));
-            rows.push(Row::field(
-                "Swap (GiB)",
-                &request.swap_gib.to_string(),
-                Field::Swap,
-            ));
-        }
         if request.layout != DiskLayout::InPlace {
             rows.push(Row::action(
-                "Edit disk partitions (cfdisk)",
-                Control::Choose(DeviceSlot::PartitionEditor),
+                format!("Root filesystem    {} ▾", request.filesystem.name()),
+                Control::ChooseStorage(StorageChoice::Filesystem(None)),
             ));
+            if matches!(request.layout, DiskLayout::Erase { .. }) {
+                rows.push(Row::note(
+                    "Root /             Uses the remaining disk space",
+                ));
+            }
+            if !matches!(request.layout, DiskLayout::Mounted { .. }) {
+                rows.push(checkbox(
+                    "Encrypt root (LUKS2)",
+                    request.encrypt,
+                    Setting::Encryption,
+                ));
+            }
+            rows.push(checkbox("Enable swap", request.swap_gib > 0, Setting::Swap));
+            if request.swap_gib > 0 {
+                if let DiskLayout::Partitions {
+                    swap, format_swap, ..
+                } = &request.layout
+                    && !request.encrypt
+                {
+                    rows.push(Row::action(
+                        format!(
+                            "Swap device        {} ▾",
+                            swap.as_deref().unwrap_or("Swap file")
+                        ),
+                        Control::Choose(DeviceSlot::Swap),
+                    ));
+                    if swap.is_some() {
+                        rows.push(checkbox(
+                            "Format swap partition",
+                            *format_swap,
+                            Setting::FormatSwap,
+                        ));
+                    }
+                }
+                if !matches!(request.layout, DiskLayout::Partitions { .. })
+                    || !request.partition_swap()
+                {
+                    rows.push(Row::field(
+                        "Swap size (GiB)",
+                        &request.swap_gib.to_string(),
+                        Field::Swap,
+                    ));
+                }
+                if request.partition_swap() {
+                    rows.push(checkbox(
+                        "Enable hibernation",
+                        request.hibernate,
+                        Setting::Hibernate,
+                    ));
+                } else {
+                    rows.push(Row::note(
+                        "Swap file · Hibernation requires a dedicated swap partition",
+                    ));
+                }
+            }
+        }
+        if let DiskLayout::Erase { data, .. } = &request.layout {
+            for (index, partition) in data.iter().enumerate() {
+                rows.push(Row::action(
+                    format!(
+                        "Partition type     {} ▾",
+                        partition_role_name(partition.role)
+                    ),
+                    Control::ChooseStorage(StorageChoice::PartitionRole(index)),
+                ));
+                if partition.role == DataRole::Data {
+                    rows.push(Row::field(
+                        "Name under /mnt",
+                        &partition.name,
+                        Field::PartitionName(index),
+                    ));
+                }
+                rows.push(Row::action(
+                    format!("Filesystem         {} ▾", partition.filesystem.name()),
+                    Control::ChooseStorage(StorageChoice::Filesystem(Some(index))),
+                ));
+                rows.push(Row::field(
+                    "Size (GiB)",
+                    &partition.size_gib.to_string(),
+                    Field::PartitionSize(index),
+                ));
+                rows.push(Row::action(
+                    format!("Remove {}", partition.mount_point()),
+                    Control::Change(Setting::RemovePartition(index)),
+                ));
+            }
+            if data.len() < MAX_DATA_PARTITIONS {
+                rows.push(Row::action(
+                    "+ Add partition",
+                    Control::Change(Setting::AddPartition),
+                ));
+            }
         }
         rows
     }
@@ -1176,7 +1292,7 @@ impl Ui {
                     if state.install.layout == DiskLayout::InPlace {
                         "existing root filesystem"
                     } else {
-                        filesystem_name(&state.install.filesystem)
+                        state.install.filesystem.name()
                     }
                 )));
                 if self.applied {
@@ -1447,9 +1563,12 @@ impl Ui {
                     true,
                 ));
             }
-            Some(Control::Change(setting)) => {
-                change_setting(&mut state.install, setting);
-                state.plan = None;
+            Some(Control::Change(setting)) => match change_setting(&mut state.install, setting) {
+                Ok(()) => state.plan = None,
+                Err(error) => self.failure("Invalid storage setting", error),
+            },
+            Some(Control::ChooseStorage(choice)) => {
+                self.modal = Some(Modal::Pick(choice.picker(&state.install)));
             }
             Some(Control::Choose(slot)) => {
                 let choices = device_choices(&state.disks, &state.install.layout, slot);
@@ -1464,6 +1583,7 @@ impl Ui {
                         title: match slot {
                             DeviceSlot::Disk => "Choose installation disk",
                             DeviceSlot::Root => "Choose root partition",
+                            DeviceSlot::Swap => "Choose swap partition or swap file",
                             DeviceSlot::Esp => "Choose EFI System Partition",
                             DeviceSlot::AlongsideEsp => "Dedicated or existing EFI partition",
                             DeviceSlot::BootDisk => "Choose boot disk",
@@ -1528,7 +1648,6 @@ impl Ui {
                         Some(plan) => confirmation_token(plan),
                         None => return Outcome::Continue,
                     },
-                    Action::EditPartitions(disk) => format!("PARTITION {disk}"),
                     Action::Calamares => "CALAMARES".into(),
                     _ => return Outcome::Continue,
                 };
@@ -1684,13 +1803,13 @@ impl Ui {
                     let choice = picker.choices.swap_remove(picker.cursor);
                     match (picker.target, choice.value) {
                         (PickerTarget::Device(DeviceSlot::PartitionEditor), Some(disk)) => {
-                            return self.activate(
-                                state,
-                                Some(Control::Confirm(Action::EditPartitions(disk))),
-                            );
+                            return Outcome::Execute(Action::EditPartitions(disk));
                         }
                         (PickerTarget::Device(slot), Some(device)) => {
                             set_device(&mut state.install.layout, slot, device);
+                            if !state.install.partition_swap() {
+                                state.install.hibernate = false;
+                            }
                             state.plan = None;
                         }
                         (PickerTarget::Parameter(row, parameter), Some(value)) => {
@@ -1702,6 +1821,10 @@ impl Ui {
                         }
                         (PickerTarget::Parameter(row, parameter), None) => {
                             reset_parameter(state, row, parameter);
+                        }
+                        (PickerTarget::Storage(choice), _) => {
+                            choice.apply(&mut state.install, picker.cursor);
+                            state.plan = None;
                         }
                         (PickerTarget::Device(_), None) => {}
                     }
@@ -1763,6 +1886,10 @@ impl Ui {
             Field::Keymap => state.install.keymap.clone(),
             Field::Desktop => state.install.desktop.clone().unwrap_or_default(),
             Field::Swap => state.install.swap_gib.to_string(),
+            Field::PartitionSize(index) => {
+                data_partitions(&state.install)[index].size_gib.to_string()
+            }
+            Field::PartitionName(index) => data_partitions(&state.install)[index].name.clone(),
             Field::Target => match &state.install.layout {
                 DiskLayout::Mounted { target } => target.display().to_string(),
                 _ => String::new(),
@@ -1871,9 +1998,31 @@ impl Ui {
                 state.install.desktop = (!matches!(value, "" | "none")).then(|| value.into());
             }
             Field::Swap => {
-                state.install.swap_gib = value
+                let size = value
                     .parse()
-                    .map_err(|_| "Enter a whole number of GiB (0 for no swap).")?
+                    .map_err(|_| "Enter a whole number of GiB (0 for no swap).")?;
+                if size > 512 {
+                    return Err("Swap must be no larger than 512 GiB.".into());
+                }
+                state.install.swap_gib = size;
+                if size == 0 {
+                    state.install.hibernate = false;
+                }
+            }
+            Field::PartitionSize(index) => {
+                data_partitions_mut(&mut state.install)[index].size_gib = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|size| *size > 0)
+                    .ok_or("Enter a positive whole number of GiB.")?;
+            }
+            Field::PartitionName(index) => {
+                if !crate::install::safe_path_component(value) {
+                    return Err(
+                        "Enter an ordinary directory name below /mnt, such as games.".into(),
+                    );
+                }
+                data_partitions_mut(&mut state.install)[index].name = value.into();
             }
             Field::Target => {
                 let target = PathBuf::from(value);
@@ -1897,56 +2046,160 @@ impl Editor {
     }
 }
 
-fn change_setting(request: &mut InstallRequest, setting: Setting) {
-    match setting {
-        Setting::Layout => {
-            request.layout = match request.layout {
-                DiskLayout::Erase { .. } => {
-                    request.boot_mode = BootMode::Uefi;
-                    DiskLayout::Alongside {
-                        disk: String::new(),
-                        esp: None,
-                    }
-                }
-                DiskLayout::Alongside { .. } => DiskLayout::Partitions {
-                    root: String::new(),
-                    esp: None,
-                    boot_disk: None,
-                    format_root: false,
-                    format_esp: false,
-                },
-                DiskLayout::Partitions { .. } => DiskLayout::Mounted {
-                    target: PathBuf::from("/mnt"),
-                },
-                DiskLayout::Mounted { .. } => {
-                    request.boot_mode = if std::path::Path::new("/sys/firmware/efi").is_dir() {
-                        BootMode::Uefi
-                    } else {
-                        BootMode::Bios
-                    };
-                    request.swap_gib = 0;
-                    DiskLayout::InPlace
-                }
-                DiskLayout::InPlace => DiskLayout::Erase {
-                    disk: String::new(),
-                },
-            };
-            request.encrypt = false;
+fn data_partitions(request: &InstallRequest) -> &[DataPartition] {
+    let DiskLayout::Erase { data, .. } = &request.layout else {
+        unreachable!("partition choices are shown for a fresh layout")
+    };
+    data
+}
+
+fn data_partitions_mut(request: &mut InstallRequest) -> &mut Vec<DataPartition> {
+    let DiskLayout::Erase { data, .. } = &mut request.layout else {
+        unreachable!("partition choices are shown for a fresh layout")
+    };
+    data
+}
+
+const PARTITION_ROLES: [DataRole; 2] = [DataRole::Home, DataRole::Data];
+
+fn partition_role_name(role: DataRole) -> &'static str {
+    match role {
+        DataRole::Home => "Home (/home)",
+        DataRole::Data => "Data (under /mnt)",
+    }
+}
+
+impl StorageChoice {
+    fn picker(self, request: &InstallRequest) -> Picker {
+        let (title, labels, cursor) = match self {
+            Self::Layout => (
+                "Installation layout",
+                LAYOUTS.to_vec(),
+                layout_index(&request.layout),
+            ),
+            Self::Filesystem(index) => {
+                let selected = index.map_or(request.filesystem, |i| {
+                    data_partitions(request)[i].filesystem
+                });
+                (
+                    "Filesystem",
+                    FileSystem::ALL.iter().map(|fs| fs.name()).collect(),
+                    FileSystem::ALL
+                        .iter()
+                        .position(|fs| *fs == selected)
+                        .unwrap(),
+                )
+            }
+            Self::PartitionRole(index) => (
+                "Partition type",
+                PARTITION_ROLES
+                    .iter()
+                    .map(|role| partition_role_name(*role))
+                    .collect(),
+                usize::from(data_partitions(request)[index].role == DataRole::Data),
+            ),
+        };
+        Picker {
+            target: PickerTarget::Storage(self),
+            title: title.into(),
+            choices: labels
+                .into_iter()
+                .map(|label| Choice {
+                    value: None,
+                    label: label.into(),
+                })
+                .collect(),
+            cursor,
+            offset: 0,
         }
+    }
+
+    fn apply(self, request: &mut InstallRequest, selected: usize) {
+        match self {
+            Self::Layout => set_layout(request, selected),
+            Self::Filesystem(None) => request.filesystem = FileSystem::ALL[selected],
+            Self::Filesystem(Some(index)) => {
+                data_partitions_mut(request)[index].filesystem = FileSystem::ALL[selected];
+            }
+            Self::PartitionRole(index) => {
+                data_partitions_mut(request)[index].role = PARTITION_ROLES[selected];
+            }
+        }
+    }
+}
+
+fn set_layout(request: &mut InstallRequest, selected: usize) {
+    let current = layout_index(&request.layout);
+    if selected == current {
+        return;
+    }
+    let native_boot = if Path::new("/sys/firmware/efi").is_dir() {
+        BootMode::Uefi
+    } else {
+        BootMode::Bios
+    };
+    if current == 1 || selected == 4 {
+        request.boot_mode = native_boot;
+    }
+    request.layout = match selected {
+        0 => DiskLayout::Erase {
+            disk: String::new(),
+            data: Vec::new(),
+        },
+        1 => {
+            request.boot_mode = BootMode::Uefi;
+            DiskLayout::Alongside {
+                disk: String::new(),
+                esp: None,
+            }
+        }
+        2 => DiskLayout::Partitions {
+            root: String::new(),
+            esp: None,
+            boot_disk: None,
+            format_root: false,
+            format_esp: false,
+            swap: None,
+            format_swap: false,
+        },
+        3 => DiskLayout::Mounted {
+            target: PathBuf::from("/mnt"),
+        },
+        4 => {
+            request.swap_gib = 0;
+            DiskLayout::InPlace
+        }
+        _ => unreachable!("layout picker selection"),
+    };
+    request.encrypt = false;
+    request.hibernate = false;
+}
+
+fn change_setting(request: &mut InstallRequest, setting: Setting) -> Result<(), String> {
+    match setting {
         Setting::Boot => {
             request.boot_mode = match request.boot_mode {
                 BootMode::Uefi => BootMode::Bios,
                 BootMode::Bios => BootMode::Uefi,
+            };
+            if let DiskLayout::Partitions {
+                esp,
+                boot_disk,
+                format_esp,
+                ..
+            } = &mut request.layout
+            {
+                *esp = None;
+                *boot_disk = None;
+                *format_esp = false;
             }
         }
-        Setting::Filesystem => {
-            request.filesystem = match request.filesystem {
-                FileSystem::Ext4 => FileSystem::Btrfs,
-                FileSystem::Btrfs => FileSystem::Xfs,
-                FileSystem::Xfs => FileSystem::Ext4,
+        Setting::Encryption => {
+            request.encrypt = !request.encrypt;
+            if request.encrypt {
+                request.hibernate = false;
             }
         }
-        Setting::Encryption => request.encrypt = !request.encrypt,
         Setting::Network => request.network_manager = !request.network_manager,
         Setting::FormatRoot => {
             if let DiskLayout::Partitions { format_root, .. } = &mut request.layout {
@@ -1958,7 +2211,58 @@ fn change_setting(request: &mut InstallRequest, setting: Setting) {
                 *format_esp = !*format_esp;
             }
         }
+        Setting::FormatSwap => {
+            if let DiskLayout::Partitions { format_swap, .. } = &mut request.layout {
+                *format_swap = !*format_swap;
+            }
+        }
+        Setting::Swap => {
+            request.swap_gib = if request.swap_gib == 0 { 4 } else { 0 };
+            request.hibernate = false;
+            if request.swap_gib == 0
+                && let DiskLayout::Partitions { format_swap, .. } = &mut request.layout
+            {
+                *format_swap = false;
+            }
+        }
+        Setting::Hibernate => {
+            if !request.hibernate {
+                let minimum = hibernation_swap_gib()?;
+                if minimum > 512 {
+                    return Err(
+                        "Available RAM exceeds the supported swap size for hibernation.".into(),
+                    );
+                }
+                if matches!(request.layout, DiskLayout::Erase { .. }) {
+                    request.swap_gib = request.swap_gib.max(minimum);
+                }
+            }
+            request.hibernate = !request.hibernate;
+        }
+        Setting::AddPartition => {
+            let filesystem = request.filesystem;
+            let data = data_partitions_mut(request);
+            let role = if data.iter().any(|part| part.role == DataRole::Home) {
+                DataRole::Data
+            } else {
+                DataRole::Home
+            };
+            let name = (1..)
+                .map(|n| format!("data{n}"))
+                .find(|name| data.iter().all(|part| &part.name != name))
+                .expect("a free data directory name");
+            data.push(DataPartition {
+                role,
+                filesystem,
+                size_gib: 16,
+                name,
+            });
+        }
+        Setting::RemovePartition(index) => {
+            data_partitions_mut(request).remove(index);
+        }
     }
+    Ok(())
 }
 
 fn device_choices(devices: &[BlockDevice], layout: &DiskLayout, slot: DeviceSlot) -> Vec<Choice> {
@@ -1966,9 +2270,10 @@ fn device_choices(devices: &[BlockDevice], layout: &DiskLayout, slot: DeviceSlot
         for device in devices {
             let target = match slot {
                 DeviceSlot::Disk | DeviceSlot::BootDisk | DeviceSlot::PartitionEditor => {
-                    device.kind == "disk"
+                    device.kind == "disk" && device.idle_in_inventory()
                 }
                 DeviceSlot::Root => ["part", "crypt", "lvm"].contains(&device.kind.as_str()),
+                DeviceSlot::Swap => device.is_swap_partition() && device.idle_in_inventory(),
                 DeviceSlot::Esp => device.kind == "part",
                 DeviceSlot::AlongsideEsp => {
                     device.kind == "part" && device.fstype.as_deref() == Some("vfat")
@@ -1993,6 +2298,12 @@ fn device_choices(devices: &[BlockDevice], layout: &DiskLayout, slot: DeviceSlot
         }
     }
     let mut choices = Vec::new();
+    if matches!(slot, DeviceSlot::Swap) {
+        choices.push(Choice {
+            value: Some(String::new()),
+            label: "Create a swap file on root".into(),
+        });
+    }
     if let (DiskLayout::Alongside { disk, .. }, DeviceSlot::AlongsideEsp) = (layout, slot) {
         choices.push(Choice {
             value: Some(String::new()),
@@ -2009,7 +2320,7 @@ fn device_choices(devices: &[BlockDevice], layout: &DiskLayout, slot: DeviceSlot
 
 fn set_device(layout: &mut DiskLayout, slot: DeviceSlot, value: String) {
     match (layout, slot) {
-        (DiskLayout::Erase { disk }, DeviceSlot::Disk) => *disk = value,
+        (DiskLayout::Erase { disk, .. }, DeviceSlot::Disk) => *disk = value,
         (DiskLayout::Alongside { disk, esp }, DeviceSlot::Disk) => {
             if *disk != value {
                 *disk = value;
@@ -2020,6 +2331,18 @@ fn set_device(layout: &mut DiskLayout, slot: DeviceSlot, value: String) {
             *esp = (!value.is_empty()).then_some(value);
         }
         (DiskLayout::Partitions { root, .. }, DeviceSlot::Root) => *root = value,
+        (
+            DiskLayout::Partitions {
+                swap, format_swap, ..
+            },
+            DeviceSlot::Swap,
+        ) => {
+            let chosen = (!value.is_empty()).then_some(value);
+            if *swap != chosen {
+                *swap = chosen;
+                *format_swap = false;
+            }
+        }
         (DiskLayout::Partitions { esp, .. }, DeviceSlot::Esp) => *esp = Some(value),
         (DiskLayout::Partitions { boot_disk, .. }, DeviceSlot::BootDisk) => {
             *boot_disk = Some(value)
@@ -2449,6 +2772,8 @@ fn field_title(field: Field) -> &'static str {
         Field::Keymap => "Console keymap",
         Field::Desktop => "Desktop environment",
         Field::Swap => "Swap size in GiB",
+        Field::PartitionSize(_) => "Partition size in GiB",
+        Field::PartitionName(_) => "Directory name below /mnt",
         Field::Target => "Installation mount point",
     }
 }
@@ -2857,6 +3182,7 @@ mod tests {
                 filesystem: FileSystem::Ext4,
                 encrypt: false,
                 swap_gib: 0,
+                hibernate: false,
                 hostname: "test-host".into(),
                 username: "test-user".into(),
                 timezone: "UTC".into(),
@@ -3474,22 +3800,25 @@ mod tests {
     }
 
     #[test]
-    fn disk_editor_requires_exact_device_confirmation_before_callback() {
+    fn disk_editor_opens_on_device_selection() {
         let mut state = session();
         let mut ui = Ui::default();
-        ui.activate(
+        let outcome = ui.modal_event(
             &mut state,
-            Some(Control::Confirm(Action::EditPartitions("/dev/test".into()))),
+            Modal::Pick(Picker {
+                target: PickerTarget::Device(DeviceSlot::PartitionEditor),
+                title: "Select disk for cfdisk".into(),
+                choices: vec![Choice {
+                    value: Some("/dev/test".into()),
+                    label: "/dev/test".into(),
+                }],
+                cursor: 0,
+                offset: 0,
+            }),
+            Event::Key(13),
         );
-        ui.event(&mut state, Event::Text("PARTITION /dev/wrong".into()));
-        assert!(matches!(
-            ui.event(&mut state, Event::Key(13)),
-            Outcome::Continue
-        ));
-        ui.event(&mut state, Event::Key(21));
-        ui.event(&mut state, Event::Text("PARTITION /dev/test".into()));
         assert!(
-            matches!(ui.event(&mut state, Event::Key(13)), Outcome::Execute(Action::EditPartitions(path)) if path == "/dev/test")
+            matches!(outcome, Outcome::Execute(Action::EditPartitions(path)) if path == "/dev/test")
         );
     }
 
@@ -3498,9 +3827,10 @@ mod tests {
         let mut request = session().install;
         request.layout = DiskLayout::Erase {
             disk: String::new(),
+            data: Vec::new(),
         };
         request.boot_mode = BootMode::Bios;
-        change_setting(&mut request, Setting::Layout);
+        set_layout(&mut request, 1);
         assert_eq!(request.boot_mode, BootMode::Uefi);
         set_device(&mut request.layout, DeviceSlot::Disk, "/dev/first".into());
         set_device(
@@ -3516,5 +3846,57 @@ mod tests {
                 esp: None
             }
         );
+    }
+
+    #[test]
+    fn guided_layout_adds_and_edits_a_partition_from_storage_controls() {
+        let mut state = session();
+        let mut ui = Ui::default();
+        set_layout(&mut state.install, 0);
+        assert!(
+            ui.storage_rows(&state)
+                .iter()
+                .any(|row| row.text == "[ ] Enable swap")
+        );
+        assert!(
+            ui.storage_rows(&state)
+                .iter()
+                .all(|row| !row.text.contains("Enable hibernation"))
+        );
+        ui.activate(&mut state, Some(Control::Change(Setting::Swap)));
+        ui.activate(&mut state, Some(Control::Change(Setting::AddPartition)));
+        assert_eq!(data_partitions(&state.install)[0].role, DataRole::Home);
+        assert!(
+            ui.storage_rows(&state)
+                .iter()
+                .any(|row| row.text == "[ ] Enable hibernation")
+        );
+
+        ui.activate(
+            &mut state,
+            Some(Control::ChooseStorage(StorageChoice::PartitionRole(0))),
+        );
+        ui.event(&mut state, Event::Key(KEY_DOWN));
+        ui.event(&mut state, Event::Key(13));
+        ui.set_field(&mut state, Field::PartitionName(0), "media")
+            .unwrap();
+        ui.set_field(&mut state, Field::PartitionSize(0), "24")
+            .unwrap();
+
+        ui.activate(
+            &mut state,
+            Some(Control::ChooseStorage(StorageChoice::Filesystem(Some(0)))),
+        );
+        ui.event(&mut state, Event::Key(KEY_DOWN));
+        ui.event(&mut state, Event::Key(13));
+        let partition = &data_partitions(&state.install)[0];
+        assert_eq!(partition.filesystem, FileSystem::Btrfs);
+        assert_eq!(partition.mount_point(), "/mnt/media");
+        assert_eq!(partition.size_gib, 24);
+        ui.activate(
+            &mut state,
+            Some(Control::Change(Setting::RemovePartition(0))),
+        );
+        assert!(data_partitions(&state.install).is_empty());
     }
 }

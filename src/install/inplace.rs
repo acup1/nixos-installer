@@ -646,7 +646,7 @@ pub(super) fn apply(
     let secrets = Path::new(SECRETS);
     let marker = Path::new(MARKER);
     let hardware = capture("nixos-generate-config", ["--show-hardware-config"])?;
-    let configuration = configuration(request, None, state_version)?.replace(
+    let configuration = configuration(request, None, None, state_version)?.replace(
         "[ ./hardware-configuration.nix ]",
         "[ ./hardware-configuration.nix ./inplace.nix ]",
     );

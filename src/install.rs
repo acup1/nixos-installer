@@ -1,5 +1,7 @@
 //! NixOS live-system installation. Planning inspects disks and never modifies them.
 mod inplace;
+mod partition;
+pub use partition::{DataPartition, DataRole, MAX_DATA_PARTITIONS, hibernation_swap_gib};
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -7,8 +9,6 @@ use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const ROOT_MINIMUM: u64 = 8 * GIB;
@@ -26,8 +26,9 @@ pub fn default_install_layout() -> DiskLayout {
     if inplace::is_installed_linux_root() {
         DiskLayout::InPlace
     } else {
-        DiskLayout::Mounted {
-            target: PathBuf::from(TARGET),
+        DiskLayout::Erase {
+            disk: String::new(),
+            data: Vec::new(),
         }
     }
 }
@@ -68,6 +69,7 @@ fn deserialize_mountpoints<'de, D: serde::Deserializer<'de>>(
 pub enum DiskLayout {
     Erase {
         disk: String,
+        data: Vec<DataPartition>,
     },
     Alongside {
         disk: String,
@@ -79,6 +81,8 @@ pub enum DiskLayout {
         boot_disk: Option<String>,
         format_root: bool,
         format_esp: bool,
+        swap: Option<String>,
+        format_swap: bool,
     },
     Mounted {
         target: PathBuf,
@@ -100,7 +104,9 @@ pub enum FileSystem {
 }
 
 impl FileSystem {
-    fn name(self) -> &'static str {
+    pub const ALL: [Self; 3] = [Self::Ext4, Self::Btrfs, Self::Xfs];
+
+    pub fn name(self) -> &'static str {
         match self {
             Self::Ext4 => "ext4",
             Self::Btrfs => "btrfs",
@@ -124,6 +130,7 @@ pub struct InstallRequest {
     pub filesystem: FileSystem,
     pub encrypt: bool,
     pub swap_gib: u32,
+    pub hibernate: bool,
     pub hostname: String,
     pub username: String,
     pub timezone: String,
@@ -131,6 +138,21 @@ pub struct InstallRequest {
     pub keymap: String,
     pub desktop: Option<String>,
     pub network_manager: bool,
+}
+
+impl InstallRequest {
+    pub fn partition_swap(&self) -> bool {
+        self.swap_gib > 0
+            && !self.encrypt
+            && matches!(
+                self.layout,
+                DiskLayout::Erase { .. } | DiskLayout::Partitions { swap: Some(_), .. }
+            )
+    }
+
+    fn file_swap(&self) -> bool {
+        self.swap_gib > 0 && !self.partition_swap()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +170,7 @@ struct CheckedTarget {
     boot_disk: Option<DeviceIdentity>,
     root: Option<DeviceIdentity>,
     esp: Option<DeviceIdentity>,
+    swap: Option<DeviceIdentity>,
     mounts: Vec<Mount>,
     alongside: Option<AlongsidePlan>,
     in_place: Option<inplace::Account>,
@@ -245,7 +268,14 @@ pub fn edit_partitions(disk: &str) -> Result<(), String> {
     require_kind(device, "disk")?;
     require_idle_tree(device)?;
     check_exclusive(device)?;
-    command("cfdisk", ["--lock=yes", "--", disk])?;
+    let mut editor = Command::new("cfdisk");
+    editor.args(["--lock=yes", "--", disk]);
+    if capture("infocmp", [] as [&str; 0]).is_err()
+        && capture("infocmp", ["xterm-256color"]).is_ok()
+    {
+        editor.env("TERM", "xterm-256color");
+    }
+    run_command("cfdisk", editor)?;
     command("udevadm", ["settle"])?;
     Ok(())
 }
@@ -267,13 +297,15 @@ pub fn build_plan(request: InstallRequest) -> Result<InstallPlan, String> {
 
 pub fn confirmation_token(plan: &InstallPlan) -> String {
     match &plan.approved_request.layout {
-        DiskLayout::Erase { disk } => format!("ERASE {disk}"),
+        DiskLayout::Erase { disk, .. } => format!("ERASE {disk}"),
         DiskLayout::Alongside { disk, .. } => format!("INSTALL ALONGSIDE {disk}"),
         DiskLayout::Partitions {
             root,
             esp,
             format_root,
             format_esp,
+            swap,
+            format_swap,
             ..
         } => {
             let mut formatted = Vec::new();
@@ -282,6 +314,12 @@ pub fn confirmation_token(plan: &InstallPlan) -> String {
             }
             if *format_esp && let Some(esp) = esp {
                 formatted.push(esp.as_str());
+            }
+            if plan.approved_request.partition_swap()
+                && *format_swap
+                && let Some(swap) = swap
+            {
+                formatted.push(swap.as_str());
             }
             if formatted.is_empty() {
                 format!("INSTALL {root}")
@@ -322,6 +360,19 @@ fn validate_settings(request: &InstallRequest) -> Result<(), String> {
     if request.swap_gib > 512 {
         return Err("Swap must be no larger than 512 GiB.".into());
     }
+    if request.hibernate {
+        if !request.partition_swap() {
+            return Err(
+                "Hibernation requires a dedicated swap partition without root encryption.".into(),
+            );
+        }
+        let minimum = hibernation_swap_gib()?;
+        if matches!(request.layout, DiskLayout::Erase { .. }) && request.swap_gib < minimum {
+            return Err(format!(
+                "Hibernation requires at least {minimum} GiB of swap on this machine."
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -333,7 +384,7 @@ fn plain_setting(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_.@+-".contains(&c))
 }
 
-fn safe_path_component(value: &str) -> bool {
+pub(crate) fn safe_path_component(value: &str) -> bool {
     plain_setting(value) && value != "." && value != ".."
 }
 
@@ -369,24 +420,29 @@ fn inspect_target(
         boot_disk: None,
         root: None,
         esp: None,
+        swap: None,
         mounts: Vec::new(),
         alongside: None,
         in_place: None,
         bios_entry: None,
     };
-    let required_root_size = ROOT_MINIMUM + u64::from(request.swap_gib) * GIB;
+    let required_root_size = ROOT_MINIMUM
+        + u64::from(if request.file_swap() {
+            request.swap_gib
+        } else {
+            0
+        }) * GIB;
 
     match &request.layout {
         DiskLayout::InPlace => inplace::inspect(request, devices, current_mounts, &mut checked)?,
-        DiskLayout::Erase { disk } => {
+        DiskLayout::Erase { disk, data } => {
+            if disk.is_empty() {
+                return Err("Choose a target disk on the Installation storage step.".into());
+            }
             let device = lookup(devices, disk)?;
             require_kind(device, "disk")?;
             require_idle_tree(device)?;
-            if device.size < required_root_size + 2 * GIB {
-                return Err(format!(
-                    "{disk} is too small for the requested system and swap."
-                ));
-            }
+            partition::validate_fresh_sizes(request, data, device.size)?;
             require_unused_target(&checked.target, current_mounts)?;
             checked.boot_disk = Some(identity(device)?);
         }
@@ -426,7 +482,12 @@ fn inspect_target(
             boot_disk,
             format_root,
             format_esp,
+            swap,
+            format_swap,
         } => {
+            if root.is_empty() {
+                return Err("Choose a root partition on the Installation storage step.".into());
+            }
             let root_device = lookup(devices, root)?;
             require_kind(root_device, "part")?;
             require_idle_tree(root_device)?;
@@ -448,6 +509,33 @@ fn inspect_target(
                 ));
             }
             checked.root = Some(identity(root_device)?);
+            if request.partition_swap() {
+                let swap_path = swap.as_deref().ok_or("Select a swap partition.")?;
+                let device = lookup(devices, swap_path)?;
+                require_kind(device, "part")?;
+                require_idle_tree(device)?;
+                if device.number == root_device.number
+                    || esp.as_deref() == Some(swap_path)
+                    || parent_disk(devices, device)?.number != parent.number
+                    || !device.is_swap_partition()
+                {
+                    return Err("Select a separate swap partition on the same disk as root.".into());
+                }
+                if !*format_swap && device.fstype.as_deref() != Some("swap") {
+                    return Err(format!(
+                        "{swap_path} must be formatted as swap. Select Format swap partition or use a swap file."
+                    ));
+                }
+                if request.hibernate {
+                    let minimum = hibernation_swap_gib()?;
+                    if device.size < u64::from(minimum) * GIB {
+                        return Err(format!(
+                            "Hibernation requires a swap partition of at least {minimum} GiB."
+                        ));
+                    }
+                }
+                checked.swap = Some(identity(device)?);
+            }
 
             match request.boot_mode {
                 BootMode::Uefi => {
@@ -576,6 +664,22 @@ fn is_efi_partition(device: &BlockDevice) -> bool {
     device.parttype.as_deref().is_some_and(|value| {
         value.eq_ignore_ascii_case(EFI_GUID) || value.eq_ignore_ascii_case("0xef")
     })
+}
+
+impl BlockDevice {
+    pub fn is_swap_partition(&self) -> bool {
+        self.kind == "part"
+            && (self.fstype.as_deref() == Some("swap")
+                || self.parttype.as_deref().is_some_and(|kind| {
+                    kind.eq_ignore_ascii_case(partition::SWAP_GUID) || kind == "0x82"
+                }))
+    }
+
+    pub fn idle_in_inventory(&self) -> bool {
+        !self.read_only
+            && self.mountpoints.is_empty()
+            && self.children.iter().all(Self::idle_in_inventory)
+    }
 }
 
 fn read_gpt(disk: &str) -> Result<Gpt, String> {
@@ -910,8 +1014,14 @@ fn target_mounts(target: &Path, current_mounts: &[Mount]) -> Result<Vec<Mount>, 
         .filter(|mount| mount.destination == target)
         .collect();
     let [root] = top_level.as_slice() else {
+        if top_level.is_empty() {
+            return Err(format!(
+                "{} is not mounted. Mount the root filesystem there or choose an installation layout that prepares the disk.",
+                target.display()
+            ));
+        }
         return Err(format!(
-            "{} must be mounted exactly once.",
+            "{} has multiple mounts. Leave just the target root mounted there.",
             target.display()
         ));
     };
@@ -1078,17 +1188,27 @@ fn describe_steps(request: &InstallRequest, checked: &CheckedTarget) -> Vec<Stri
     let mut steps = Vec::new();
     match &request.layout {
         DiskLayout::InPlace => return inplace::describe(request, checked),
-        DiskLayout::Erase { disk } => {
+        DiskLayout::Erase { disk, data } => {
             steps.push(format!("Erase all filesystems and partitions on {disk}."));
             steps.push(match request.boot_mode {
                 BootMode::Uefi => format!(
-                    "Create a GPT, a {} MiB FAT EFI partition, and a root partition.",
+                    "Create a GPT and a {} MiB FAT32 EFI partition at /boot.",
                     ESP_SIZE_MIB
                 ),
-                BootMode::Bios => {
-                    "Create a GPT, a 4 MiB BIOS boot partition, and a root partition.".into()
-                }
+                BootMode::Bios => "Create a GPT and a 4 MiB BIOS boot partition for GRUB.".into(),
             });
+            for partition in data {
+                steps.push(format!(
+                    "Create and format {} as {} ({} GiB).",
+                    partition.mount_point(),
+                    partition.filesystem.name(),
+                    partition.size_gib
+                ));
+            }
+            steps.push(format!(
+                "Use the remaining space for / ({}).",
+                request.filesystem.name()
+            ));
         }
         DiskLayout::Alongside { disk, esp } => {
             let alongside = checked
@@ -1120,6 +1240,8 @@ fn describe_steps(request: &InstallRequest, checked: &CheckedTarget) -> Vec<Stri
             esp,
             format_root,
             format_esp,
+            swap,
+            format_swap,
             ..
         } => {
             steps.push(if *format_root {
@@ -1132,6 +1254,15 @@ fn describe_steps(request: &InstallRequest, checked: &CheckedTarget) -> Vec<Stri
                     format!("Format EFI system partition {esp} as FAT32.")
                 } else {
                     format!("Keep EFI system partition {esp} and mount it at /boot.")
+                });
+            }
+            if request.partition_swap()
+                && let Some(swap) = swap
+            {
+                steps.push(if *format_swap {
+                    format!("Format {swap} as swap.")
+                } else {
+                    format!("Use the existing swap filesystem on {swap}.")
                 });
             }
         }
@@ -1153,11 +1284,16 @@ fn describe_steps(request: &InstallRequest, checked: &CheckedTarget) -> Vec<Stri
     if request.encrypt {
         steps.push("Encrypt the new root with LUKS2 and prompt for its passphrase.".into());
     }
-    if request.swap_gib > 0 {
+    if request.partition_swap() && matches!(request.layout, DiskLayout::Erase { .. }) {
+        steps.push(format!("Create a {} GiB swap partition.", request.swap_gib));
+    } else if request.file_swap() {
         steps.push(format!(
             "Create a {} GiB swap file on the target root.",
             request.swap_gib
         ));
+    }
+    if request.hibernate {
+        steps.push("Configure hibernation resume from the swap partition.".into());
     }
     steps.push(format!(
         "Install NixOS at {} using {} with {}.",
@@ -1257,7 +1393,7 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
         "lsblk",
     ];
     match &request.layout {
-        DiskLayout::Erase { .. } => {
+        DiskLayout::Erase { data, .. } => {
             tools.extend([
                 "sfdisk",
                 "udevadm",
@@ -1267,6 +1403,13 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
             ]);
             if request.boot_mode == BootMode::Uefi {
                 tools.push("mkfs.fat");
+            }
+            tools.extend(
+                data.iter()
+                    .map(|partition| partition.filesystem.formatter()),
+            );
+            if request.partition_swap() {
+                tools.push("mkswap");
             }
         }
         DiskLayout::Alongside { esp, .. } => {
@@ -1284,6 +1427,7 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
         DiskLayout::Partitions {
             format_root,
             format_esp,
+            format_swap,
             ..
         } => {
             tools.extend(["mount", "umount"]);
@@ -1293,6 +1437,9 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
             if *format_esp {
                 tools.push("mkfs.fat");
             }
+            if *format_swap && request.partition_swap() {
+                tools.push("mkswap");
+            }
         }
         DiskLayout::Mounted { .. } => {}
         DiskLayout::InPlace => unreachable!("in-place preflight handled separately"),
@@ -1300,7 +1447,7 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
     if request.encrypt {
         tools.push("cryptsetup");
     }
-    if request.swap_gib > 0 {
+    if request.file_swap() {
         tools.push("df");
         match request.filesystem {
             FileSystem::Btrfs => tools.push("btrfs"),
@@ -1321,11 +1468,20 @@ fn install(
     let boot_disk = checked.boot_disk.as_ref().map(stable_disk_path);
     let mut root = checked.root.clone();
     let mut esp = checked.esp.clone();
-    let (format_root, format_esp) = match request.layout {
-        DiskLayout::Erase { .. } => {
+    let mut swap_device = None;
+    let mut new_data = Vec::new();
+    let (format_root, format_esp) = match &request.layout {
+        DiskLayout::Erase { data, .. } => {
             let approved_disk = checked.boot_disk.as_ref().ok_or("Missing approved disk.")?;
-            partition_disk(approved_disk, request.boot_mode)?;
-            (root, esp) = wait_partitions(approved_disk, request.boot_mode)?;
+            let partitions = partition::create(approved_disk, request, data)?;
+            root = Some(partitions.root);
+            esp = partitions.esp;
+            swap_device = partitions
+                .swap
+                .as_ref()
+                .map(|device| partition::prepare_swap(device, true))
+                .transpose()?;
+            new_data = partitions.data;
             (true, request.boot_mode == BootMode::Uefi)
         }
         DiskLayout::Alongside { .. } => {
@@ -1345,8 +1501,16 @@ fn install(
         DiskLayout::Partitions {
             format_root,
             format_esp,
+            format_swap,
             ..
-        } => (format_root, format_esp),
+        } => {
+            swap_device = checked
+                .swap
+                .as_ref()
+                .map(|device| partition::prepare_swap(device, *format_swap))
+                .transpose()?;
+            (*format_root, *format_esp)
+        }
         DiskLayout::Mounted { .. } => (false, false),
         DiskLayout::InPlace => unreachable!("in-place apply handled separately"),
     };
@@ -1381,14 +1545,7 @@ fn install(
             PathBuf::from(&root.record.path)
         };
         if format_root {
-            let force = match request.filesystem {
-                FileSystem::Ext4 => "-F",
-                _ => "-f",
-            };
-            command(
-                request.filesystem.formatter(),
-                [OsStr::new(force), root_path.as_os_str()],
-            )?;
+            partition::format_filesystem(request.filesystem, &root_path)?;
         }
         require_unused_target(target, &mounts()?)?;
         create_directory(target)?;
@@ -1404,6 +1561,17 @@ fn install(
             create_directory(&boot_dir)?;
             session.mount(Path::new(&esp.record.path), &boot_dir, "vfat")?;
         }
+        for (device, partition) in new_data {
+            ensure_same_idle(&device)?;
+            let source = Path::new(&device.record.path);
+            partition::format_filesystem(partition.filesystem, source)?;
+            let destination = target.join(partition.mount_point().trim_start_matches('/'));
+            if partition.role == DataRole::Data {
+                create_directory(&target.join("mnt"))?;
+            }
+            create_directory(&destination)?;
+            session.mount(source, &destination, partition.filesystem.name())?;
+        }
     }
 
     let accepted_mounts = target_mounts(target, &mounts()?)?;
@@ -1414,7 +1582,7 @@ fn install(
     if shared_esp(request) {
         verify_shared_esp(target, &request.hostname)?;
     }
-    if request.swap_gib > 0 {
+    if request.file_swap() {
         create_swap(target, request)?;
     }
     let config_dir = target.join("etc/nixos");
@@ -1430,7 +1598,12 @@ fn install(
         ],
     )?;
     write_new(&config_dir.join("hardware-configuration.nix"), &hardware)?;
-    let configuration = configuration(request, boot_disk.as_deref(), state_version)?;
+    let configuration = configuration(
+        request,
+        boot_disk.as_deref(),
+        swap_device.as_deref(),
+        state_version,
+    )?;
     write_new(
         &config_dir.join("configuration.nix"),
         configuration.as_bytes(),
@@ -1529,25 +1702,16 @@ fn stable_disk_path(device: &DeviceIdentity) -> String {
         .unwrap_or_else(|| device.record.path.clone())
 }
 
-fn partition_disk(disk: &DeviceIdentity, boot: BootMode) -> Result<(), String> {
-    let boot_partition = match boot {
-        BootMode::Uefi => format!("size={ESP_SIZE_MIB}MiB, type={EFI_GUID}"),
-        BootMode::Bios => format!("size=4MiB, type={BIOS_GUID}"),
-    };
-    let layout = format!("label: gpt\nunit: sectors\n\n{boot_partition}\ntype={LINUX_GUID}\n");
+fn partition_disk(disk: &DeviceIdentity, layout: &str) -> Result<(), String> {
     let path = &disk.record.path;
     ensure_same_idle(disk)?;
     write_partition_table(
         path,
         &["--no-act", "--wipe=always", "--wipe-partitions=always"],
-        &layout,
+        layout,
     )?;
     ensure_same_idle(disk)?;
-    write_partition_table(
-        path,
-        &["--wipe=always", "--wipe-partitions=always"],
-        &layout,
-    )?;
+    write_partition_table(path, &["--wipe=always", "--wipe-partitions=always"], layout)?;
     command("udevadm", ["settle"])
 }
 
@@ -1603,99 +1767,48 @@ fn append_partitions(
     let (root, esp) = verify_append(plan, &updated)?;
     let devices = probe()?;
     let current = identity(lookup(&devices, path)?)?;
-    if current.number != disk.number
-        || current.kernel_path != disk.kernel_path
-        || current.record.size != disk.record.size
-        || current.record.serial != disk.record.serial
-        || current.record.wwn != disk.record.wwn
-    {
+    if !same_physical_disk(&current, disk) {
         return Err("The disk changed while adding the new partitions.".into());
     }
-    let identify = |partition: &GptPartition| -> Result<DeviceIdentity, String> {
-        let record = lookup(&devices, &partition.node)?;
-        require_kind(record, "part")?;
-        let identity = identity(record)?;
-        let start = fs::read_to_string(identity.kernel_path.join("start"))
-            .map_err(|error| format!("Cannot read kernel partition start: {error}"))?;
-        let offset = partition.start * updated.sector_size / 512;
-        if start.trim().parse::<u64>().ok() != Some(offset)
-            || record.size != partition.size * updated.sector_size
-            || !record
-                .partuuid
-                .as_deref()
-                .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&partition.uuid))
-            || parent_disk(&devices, record)?.number != current.record.number
-        {
-            return Err(format!(
-                "Kernel partition {} does not match the approved GPT entry.",
-                partition.node
-            ));
-        }
-        require_idle_tree(record)?;
-        Ok(identity)
-    };
+    let identify = |part| identify_gpt_partition(&devices, &current, updated.sector_size, part);
     Ok((identify(root)?, esp.map(identify).transpose()?))
 }
 
-type PartitionDevices = (Option<DeviceIdentity>, Option<DeviceIdentity>);
+fn same_physical_disk(current: &DeviceIdentity, approved: &DeviceIdentity) -> bool {
+    current.number == approved.number
+        && current.kernel_path == approved.kernel_path
+        && current.record.size == approved.record.size
+        && current.record.serial == approved.record.serial
+        && current.record.wwn == approved.record.wwn
+}
 
-fn wait_partitions(disk: &DeviceIdentity, boot: BootMode) -> Result<PartitionDevices, String> {
-    let table = read_gpt(&disk.record.path)?;
-    let [boot_entry, root_entry] = table.partitions.as_slice() else {
-        return Err("The new GPT does not have the expected two partitions.".into());
-    };
-    let boot_guid = if boot == BootMode::Uefi {
-        EFI_GUID
-    } else {
-        BIOS_GUID
-    };
-    if !boot_entry.type_guid.eq_ignore_ascii_case(boot_guid)
-        || !root_entry.type_guid.eq_ignore_ascii_case(LINUX_GUID)
+fn identify_gpt_partition(
+    devices: &[BlockDevice],
+    disk: &DeviceIdentity,
+    sector_size: u64,
+    partition: &GptPartition,
+) -> Result<DeviceIdentity, String> {
+    let record = lookup(devices, &partition.node)?;
+    require_kind(record, "part")?;
+    let identity = identity(record)?;
+    let start = fs::read_to_string(identity.kernel_path.join("start"))
+        .map_err(|error| format!("Cannot read kernel partition start: {error}"))?;
+    if start.trim().parse::<u64>().ok().filter(|_| sector_size > 0)
+        != partition
+            .start
+            .checked_mul(sector_size)
+            .map(|offset| offset / 512)
+        || partition.size.checked_mul(sector_size) != Some(record.size)
+        || !matches_gpt_part(record, partition)
+        || parent_disk(devices, record)?.number != disk.record.number
     {
-        return Err("The new GPT has unexpected partition types.".into());
+        return Err(format!(
+            "Kernel partition {} does not match the approved GPT entry.",
+            partition.node
+        ));
     }
-    for _ in 0..20 {
-        let devices = probe()?;
-        let current = lookup(&devices, &disk.record.path)?;
-        let current_identity = identity(current)?;
-        // The partition table and children were just changed. The physical device
-        // and its immutable identifiers must still be the approved ones.
-        if current_identity.number != disk.number
-            || current_identity.kernel_path != disk.kernel_path
-            || current.size != disk.record.size
-            || current.serial != disk.record.serial
-            || current.wwn != disk.record.wwn
-        {
-            return Err("The selected disk changed while partitioning.".into());
-        }
-        if current.pttype.as_deref() == Some("gpt") && current.children.len() == 2 {
-            let mut root = None;
-            let mut esp = None;
-            for child in &current.children {
-                require_kind(child, "part")?;
-                require_idle_tree(child)?;
-                let child_identity = identity(child)?;
-                let number = fs::read_to_string(child_identity.kernel_path.join("partition"))
-                    .map_err(|error| {
-                        format!("Cannot verify new partition {}: {error}", child.path)
-                    })?;
-                match number.trim() {
-                    "2" if matches_gpt_part(child, root_entry) && child.size >= ROOT_MINIMUM => {
-                        root = Some(child_identity)
-                    }
-                    "1" if boot == BootMode::Uefi && matches_gpt_part(child, boot_entry) => {
-                        esp = Some(child_identity)
-                    }
-                    _ => {}
-                }
-            }
-            if root.is_some() && (boot == BootMode::Bios || esp.is_some()) {
-                return Ok((root, esp));
-            }
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    Err("The new partitions were not visible to the kernel.".into())
+    require_idle_tree(record)?;
+    Ok(identity)
 }
 
 fn matches_gpt_part(device: &BlockDevice, partition: &GptPartition) -> bool {
@@ -1881,6 +1994,7 @@ fn verify_shared_esp(target: &Path, hostname: &str) -> Result<(), String> {
 fn configuration(
     request: &InstallRequest,
     boot_disk: Option<&str>,
+    swap_device: Option<&str>,
     state_version: &str,
 ) -> Result<String, String> {
     let boot = if matches!(request.layout, DiskLayout::InPlace) {
@@ -1899,11 +2013,7 @@ fn configuration(
     }
     };
     let desktop = desktop_lines(request.desktop.as_deref())?;
-    let swap = if request.swap_gib > 0 {
-        "  swapDevices = lib.mkForce [ { device = \"/swapfile\"; } ];\n"
-    } else {
-        "  swapDevices = lib.mkForce [];\n"
-    };
+    let swap = partition::swap_configuration(request, swap_device)?;
     let groups = if request.network_manager {
         "\"wheel\" \"networkmanager\""
     } else {
@@ -1986,8 +2096,13 @@ fn command<T: AsRef<OsStr>>(
     program: &str,
     args: impl IntoIterator<Item = T>,
 ) -> Result<(), String> {
-    let status = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    run_command(program, cmd)
+}
+
+fn run_command(program: &str, mut cmd: Command) -> Result<(), String> {
+    let status = cmd
         .env_remove("NIXOS_BASE_CONFIG")
         .status()
         .map_err(|error| format!("Cannot run {program}: {error}"))?;
@@ -2002,13 +2117,14 @@ fn command<T: AsRef<OsStr>>(
 mod tests {
     use super::*;
 
-    fn request(layout: DiskLayout) -> InstallRequest {
+    pub(super) fn request(layout: DiskLayout) -> InstallRequest {
         InstallRequest {
             layout,
             boot_mode: BootMode::Uefi,
             filesystem: FileSystem::Ext4,
             encrypt: false,
             swap_gib: 0,
+            hibernate: false,
             hostname: "workstation".into(),
             username: "owner".into(),
             timezone: "Europe/Moscow".into(),
@@ -2026,6 +2142,7 @@ mod tests {
             boot_disk: None,
             root: None,
             esp: None,
+            swap: None,
             mounts: Vec::new(),
             alongside: None,
             in_place: None,
@@ -2048,6 +2165,8 @@ mod tests {
             boot_disk: None,
             format_root: true,
             format_esp: false,
+            swap: None,
+            format_swap: false,
         });
         assert_eq!(confirmation_token(&plan), "ERASE /dev/nvme0n1p2");
         assert!(
@@ -2061,12 +2180,36 @@ mod tests {
     fn partition_and_non_destructive_modes_have_distinct_confirmation() {
         let erase = simulated_plan(DiskLayout::Erase {
             disk: "/dev/sda".into(),
+            data: Vec::new(),
         });
         let mounted = simulated_plan(DiskLayout::Mounted {
             target: "/mnt/nixos".into(),
         });
         assert_eq!(confirmation_token(&erase), "ERASE /dev/sda");
         assert_eq!(confirmation_token(&mounted), "INSTALL /mnt/nixos");
+    }
+
+    #[test]
+    fn formatting_a_selected_swap_partition_requires_its_device_in_confirmation() {
+        let mut plan = simulated_plan(DiskLayout::Partitions {
+            root: "/dev/sda3".into(),
+            esp: None,
+            boot_disk: None,
+            format_root: true,
+            format_esp: false,
+            swap: Some("/dev/sda2".into()),
+            format_swap: true,
+        });
+        plan.request.swap_gib = 4;
+        plan.approved_request = plan.request.clone();
+        assert_eq!(confirmation_token(&plan), "ERASE /dev/sda3 /dev/sda2");
+    }
+
+    #[test]
+    fn missing_mounted_target_explains_how_to_continue() {
+        let error = target_mounts(Path::new("/mnt"), &[]).unwrap_err();
+        assert!(error.starts_with("/mnt is not mounted."));
+        assert!(error.contains("choose an installation layout"));
     }
 
     fn gpt_fixture(sector_size: u64) -> Gpt {
@@ -2191,20 +2334,29 @@ mod tests {
     fn configuration_encodes_storage_boot_and_network_choices() {
         let mut request = request(DiskLayout::Erase {
             disk: "/dev/sda".into(),
+            data: Vec::new(),
         });
         request.swap_gib = 4;
+        request.hibernate = true;
         request.desktop = Some("plasma".into());
-        let efi = configuration(&request, None, "26.05").unwrap();
+        let swap = "/dev/disk/by-partuuid/aabbccdd-01";
+        let efi = configuration(&request, None, Some(swap), "26.05").unwrap();
         assert!(efi.contains("boot.loader.systemd-boot.enable = lib.mkForce true"));
         assert!(efi.contains("services.desktopManager.plasma6.enable = true"));
         assert!(efi.contains("networking.useDHCP = lib.mkOverride 90 false"));
-        assert!(efi.contains("device = \"/swapfile\""));
+        assert!(efi.contains(&format!("device = \"{swap}\"")));
+        assert!(efi.contains(&format!("boot.resumeDevice = \"{swap}\"")));
         request.boot_mode = BootMode::Bios;
-        let bios = configuration(&request, Some("/dev/disk/by-id/ata-fixture"), "26.05").unwrap();
+        request.encrypt = true;
+        request.hibernate = false;
+        let bios =
+            configuration(&request, Some("/dev/disk/by-id/ata-fixture"), None, "26.05").unwrap();
         assert!(bios.contains(
             "boot.loader.grub.devices = lib.mkForce [ \"/dev/disk/by-id/ata-fixture\" ]"
         ));
         assert!(bios.contains("system.stateVersion = \"26.05\""));
+        assert!(bios.contains("device = \"/swapfile\""));
+        assert!(!bios.contains("boot.resumeDevice"));
     }
 
     #[test]
@@ -2213,7 +2365,7 @@ mod tests {
             disk: "/dev/sda".into(),
             esp: Some("/dev/sda1".into()),
         });
-        let output = configuration(&request, None, "26.05").unwrap();
+        let output = configuration(&request, None, None, "26.05").unwrap();
         assert!(output.contains("efiBootloaderId = \"nixos-workstation\""));
         assert!(output.contains("efiInstallAsRemovable = lib.mkForce false"));
         assert!(output.contains("systemd-boot.enable = lib.mkForce false"));
@@ -2223,6 +2375,7 @@ mod tests {
     fn user_and_setting_validation_rejects_shell_and_nix_syntax() {
         let mut request = request(DiskLayout::Erase {
             disk: "/dev/sda".into(),
+            data: Vec::new(),
         });
         request.username = "owner; echo no".into();
         assert!(

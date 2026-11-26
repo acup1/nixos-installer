@@ -607,7 +607,12 @@ impl Controller {
                 state.plan = None;
                 Ok("Calamares closed".into())
             }
-            Action::LoadCatalog => self.refresh(state, false),
+            Action::LoadCatalog => {
+                if state.mode == Mode::Install {
+                    state.disks = install::probe().unwrap_or_default();
+                }
+                self.refresh(state, false)
+            }
             Action::RefreshCatalog => self.refresh(state, true),
             Action::UpdateLocalRepository(offer) => {
                 let (spec, update) = *offer;
@@ -1236,6 +1241,7 @@ fn default_request() -> InstallRequest {
         filesystem: FileSystem::Ext4,
         encrypt: false,
         swap_gib: 0,
+        hibernate: false,
         hostname: "nixos".into(),
         username: "nixos".into(),
         timezone: "UTC".into(),
