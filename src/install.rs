@@ -5,7 +5,7 @@ pub use partition::{DataPartition, DataRole, MAX_DATA_PARTITIONS, hibernation_sw
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1524,10 +1524,13 @@ fn install(
             if mapper.exists() {
                 return Err("The installer encryption mapping already exists.".into());
             }
-            command(
+            // The reviewed plan already confirmed formatting this partition.
+            install_command(
                 "cryptsetup",
+                "Create the LUKS2 container",
                 [
                     "luksFormat",
+                    "--batch-mode",
                     "--type",
                     "luks2",
                     "--verify-passphrase",
@@ -1535,8 +1538,9 @@ fn install(
                     root.record.path.as_str(),
                 ],
             )?;
-            command(
+            install_command(
                 "cryptsetup",
+                "Unlock the LUKS2 container",
                 ["open", "--", root.record.path.as_str(), name.as_str()],
             )?;
             session.mapper = Some(name);
@@ -1621,8 +1625,9 @@ fn install(
     }
 
     let flake = format!("{}#{}", config_dir.display(), request.hostname);
-    command(
+    install_command(
         "nixos-install",
+        "Build and install NixOS",
         [
             OsStr::new("--root"),
             target.as_os_str(),
@@ -2113,6 +2118,106 @@ fn run_command(program: &str, mut cmd: Command) -> Result<(), String> {
     }
 }
 
+fn install_command<T: AsRef<OsStr>>(
+    program: &str,
+    step: &str,
+    args: impl IntoIterator<Item = T>,
+) -> Result<(), String> {
+    let log_path = Path::new("/tmp").join(format!(
+        "nixos-installer-{program}-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    ));
+    let mut log = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&log_path)
+        .map_err(|error| format!("Cannot create {}: {error}", log_path.display()))?;
+    writeln!(log, "{step} ({program})").map_err(|error| error.to_string())?;
+
+    // Keep stdin and stdout on the terminal for passphrase prompts. Read stderr
+    // in chunks so prompts can be displayed immediately even without a newline.
+    let mut child = Command::new(program)
+        .args(args)
+        .env_remove("NIXOS_BASE_CONFIG")
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{step}: Cannot run {program}: {error}"))?;
+    let mut stderr = child.stderr.take().expect("child stderr was piped");
+    let mut terminal = io::stderr().lock();
+    let mut recent = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let mut logging_error = None;
+    let mut hash_error = None;
+    let stream = loop {
+        let read = match stderr.read(&mut chunk) {
+            Ok(0) => break Ok(()),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        };
+        let bytes = &chunk[..read];
+        let _ = terminal.write_all(bytes);
+        let _ = terminal.flush();
+        if logging_error.is_none() {
+            logging_error = log.write_all(bytes).err();
+        }
+        recent.extend_from_slice(bytes);
+        if hash_error.is_none()
+            && let Some(end) = recent.iter().rposition(|byte| *byte == b'\n')
+        {
+            hash_error = hash_mismatch(&String::from_utf8_lossy(&recent[..end]));
+        }
+        if recent.len() > 16 * 1024 {
+            recent.drain(..recent.len() - 16 * 1024);
+        }
+    };
+    drop(stderr);
+    let status = child
+        .wait()
+        .map_err(|error| format!("{step}: Cannot wait for {program}: {error}"))?;
+    if status.success() {
+        let _ = fs::remove_file(&log_path);
+        return Ok(());
+    }
+    let report = String::from_utf8_lossy(&recent);
+    let details = hash_error
+        .or_else(|| hash_mismatch(&report))
+        .unwrap_or_else(|| {
+            let lines: Vec<_> = report
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            lines[lines.len().saturating_sub(9)..].join("\n")
+        });
+    let log_note = match logging_error.or_else(|| stream.err()) {
+        Some(error) => format!("Partial stderr log: {} ({error})", log_path.display()),
+        None => format!("Stderr log: {}", log_path.display()),
+    };
+    Err(format!(
+        "{step}: {program} failed ({status}).\n{details}\n{log_note}"
+    ))
+}
+
+fn hash_mismatch(output: &str) -> Option<String> {
+    let mut lines = output.lines();
+    let error = lines.find(|line| line.contains("hash mismatch"))?;
+    let hashes: Vec<_> = lines.take(3).collect();
+    if !hashes.iter().any(|line| line.contains("got:")) {
+        return None;
+    }
+    Some(
+        std::iter::once(error)
+            .chain(hashes)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2210,6 +2315,23 @@ mod tests {
         let error = target_mounts(Path::new("/mnt"), &[]).unwrap_err();
         assert!(error.starts_with("/mnt is not mounted."));
         assert!(error.contains("choose an installation layout"));
+    }
+
+    #[test]
+    fn install_failure_reports_hash_mismatch_and_keeps_stderr_log() {
+        let error = install_command("sh", "Build test system", [
+            "-c",
+            "printf 'error: hash mismatch in fixture\n  specified: sha256-A\n  got: sha256-B\n' >&2; exit 102",
+        ]).unwrap_err();
+        let note = error.lines().last().unwrap();
+        let log_path = note.strip_prefix("Stderr log: ").unwrap();
+        let log = fs::read_to_string(log_path).unwrap();
+        fs::remove_file(log_path).unwrap();
+        assert!(error.contains("exit status: 102"));
+        assert!(error.contains("error: hash mismatch in fixture"));
+        assert!(error.contains("  specified: sha256-A\n  got: sha256-B"));
+        assert!(log.contains("Build test system"));
+        assert!(log.contains("error: hash mismatch in fixture"));
     }
 
     fn gpt_fixture(sector_size: u64) -> Gpt {
