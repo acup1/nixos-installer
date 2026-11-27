@@ -2,7 +2,7 @@
 mod inplace;
 mod partition;
 pub use partition::{DataPartition, DataRole, MAX_DATA_PARTITIONS, hibernation_swap_gib};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -65,7 +65,7 @@ fn deserialize_mountpoints<'de, D: serde::Deserializer<'de>>(
     Ok(values.unwrap_or_default().into_iter().flatten().collect())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiskLayout {
     Erase {
         disk: String,
@@ -90,13 +90,13 @@ pub enum DiskLayout {
     InPlace,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BootMode {
     Uefi,
     Bios,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileSystem {
     Ext4,
     Btrfs,
@@ -123,7 +123,7 @@ impl FileSystem {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallRequest {
     pub layout: DiskLayout,
     pub boot_mode: BootMode,

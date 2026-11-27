@@ -9,13 +9,13 @@ const MIB: u64 = 1024 * 1024;
 const BIOS_SIZE_MIB: u32 = 4;
 pub const MAX_DATA_PARTITIONS: usize = 125;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataRole {
     Home,
     Data,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataPartition {
     pub role: DataRole,
     pub filesystem: FileSystem,

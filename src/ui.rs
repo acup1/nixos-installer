@@ -475,6 +475,7 @@ pub fn run<T: Send + 'static>(
     mut state: Session,
     controller: T,
     handle: ActionHandler<T>,
+    checkpoint: fn(&mut T, &Session) -> Result<(), String>,
 ) -> Result<(), String> {
     use std::sync::mpsc::TryRecvError;
 
@@ -489,6 +490,7 @@ pub fn run<T: Send + 'static>(
     let mut controller = Some(controller);
     let mut job = None::<CatalogJob<T>>;
     let mut update_check = None::<LocalUpdateCheck>;
+    let mut draft_error = false;
     let mut redraw = true;
     loop {
         if let Some(active) = &job {
@@ -531,6 +533,19 @@ pub fn run<T: Send + 'static>(
             for (spec, status) in check.receiver.try_iter() {
                 ui.local_updates.insert(spec, status);
                 redraw = true;
+            }
+        }
+        if redraw && let Some(controller) = &mut controller {
+            match checkpoint(controller, &state) {
+                Ok(()) => draft_error = false,
+                Err(message) if !draft_error => {
+                    draft_error = true;
+                    ui.message = Some((
+                        format!("Cannot save the installation draft. {message}"),
+                        false,
+                    ));
+                }
+                Err(_) => {}
             }
         }
         let (height, width) = terminal.getsize();

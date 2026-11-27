@@ -1,5 +1,7 @@
 mod catalog;
 mod config;
+mod draft;
+mod inhibit;
 mod install;
 mod read_command;
 mod ui;
@@ -91,12 +93,49 @@ struct Controller {
     sources: Vec<CatalogSource>,
     loaded: Vec<SourceSpec>,
     saved: Saved,
+    draft: Option<draft::Store>,
     selector: Option<Selector>,
     inspected_host: String,
     manual: BTreeMap<(usize, String), String>,
     sources_unavailable: bool,
 }
 impl Controller {
+    fn install_selections(&self) -> &[Selected] {
+        self.draft
+            .as_ref()
+            .and_then(draft::Store::saved)
+            .map_or(&self.saved.selections, |draft| &draft.selections)
+    }
+
+    fn checkpoint(&mut self, state: &Session) -> Result<()> {
+        if self.draft.is_none() {
+            return Ok(());
+        }
+        let mut selections = self.selections(state);
+        selections.retain(|selected| state.repositories.contains(&selected.source));
+        // Preserve selections for repositories that have not been loaded yet.
+        selections.extend(
+            self.install_selections()
+                .iter()
+                .filter(|selected| {
+                    state.repositories.contains(&selected.source)
+                        && !self.sources.iter().any(|source| {
+                            source.spec == selected.source
+                                && !source.checkout.as_os_str().is_empty()
+                        })
+                })
+                .cloned(),
+        );
+        self.draft
+            .as_mut()
+            .expect("install draft")
+            .save(draft::Draft {
+                request: state.install.clone(),
+                repositories: state.repositories.clone(),
+                selections,
+            })
+    }
+
     fn selections(&self, state: &Session) -> Vec<Selected> {
         state
             .modules
@@ -181,7 +220,7 @@ impl Controller {
             .map(Selector::selections)
             .unwrap_or_else(|| {
                 if state.mode == Mode::Install {
-                    &self.saved.selections
+                    self.install_selections()
                 } else {
                     &[]
                 }
@@ -663,7 +702,17 @@ impl Controller {
                 state.plan = Some(plan);
                 Ok("Installation plan ready".into())
             }
-            Action::ApplyInstall => self.apply(state),
+            Action::ApplyInstall => {
+                let mut message = self.apply(state)?;
+                if let Some(store) = self.draft.take()
+                    && let Err(error) = store.clear()
+                {
+                    message.push_str(&format!(
+                        ". The installation draft could not be cleared. {error}"
+                    ));
+                }
+                Ok(message)
+            }
             Action::Save => self.save(state),
             Action::Rebuild => {
                 let selector = self
@@ -1171,6 +1220,7 @@ fn prepare_install_process() -> Result<bool> {
     if env::var_os(INSTALL_TOOLS).is_some() {
         return Ok(false);
     }
+    let _sleep_locks = inhibit::keep_awake();
     let live_bin = Path::new("/run/current-system/sw/bin");
     let native = Path::new("/etc/NIXOS").is_file()
         && [
@@ -1312,18 +1362,9 @@ fn run() -> Result<()> {
     )?;
     let repositories = setup
         .as_ref()
-        .and_then(|setup| setup.selector.repositories())
-        .map(<[SourceSpec]>::to_vec)
-        .unwrap_or_else(|| saved.repositories.clone());
-    let repositories = if setup.is_none() && repositories.is_empty() {
-        vec![SourceSpec {
-            repository: "https://github.com/acup1/nixos-modules.git".into(),
-            reference: "main".into(),
-            mode: SourceMode::Pinned,
-        }]
-    } else {
-        repositories
-    };
+        .and_then(|setup| setup.selector.repositories());
+    let mut repositories =
+        repositories.map_or_else(|| saved.repositories.clone(), <[SourceSpec]>::to_vec);
     let (mode, flake, selector) = match setup {
         Some(setup) => (Mode::Configure, setup.flake_override, setup.path),
         None => (Mode::Install, String::new(), String::new()),
@@ -1332,10 +1373,26 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let mut request = default_request();
+    let mut draft = None;
     if mode == Mode::Install {
         request.layout = install::default_install_layout();
         if let Some(username) = install::suggested_account() {
             request.username = username;
+        }
+        if repositories.is_empty() {
+            repositories.push(SourceSpec {
+                repository: "https://github.com/acup1/nixos-modules.git".into(),
+                reference: "main".into(),
+                mode: SourceMode::Pinned,
+            });
+        }
+        match draft::Store::open(Path::new(draft::DIRECTORY)) {
+            Ok(store) => draft = Some(store),
+            Err(error) => eprintln!("Cannot open the installation draft. {error}"),
+        }
+        if let Some(saved) = draft.as_ref().and_then(draft::Store::saved) {
+            request = saved.request.clone();
+            repositories = saved.repositories.clone();
         }
     }
     let mut state = Session::new(mode, repositories, request, flake, selector);
@@ -1346,12 +1403,18 @@ fn run() -> Result<()> {
         sources: vec![],
         loaded: vec![],
         saved,
+        draft,
         selector: None,
         inspected_host: String::new(),
         manual: BTreeMap::new(),
         sources_unavailable: false,
     };
-    ui::run(state, controller, Controller::action)
+    ui::run(
+        state,
+        controller,
+        Controller::action,
+        Controller::checkpoint,
+    )
 }
 fn main() {
     if let Err(e) = run() {
@@ -1392,11 +1455,90 @@ mod controller_tests {
             sources: vec![],
             loaded: vec![],
             saved: Saved::default(),
+            draft: None,
             selector: None,
             inspected_host: String::new(),
             manual: BTreeMap::new(),
             sources_unavailable: false,
         }
+    }
+
+    #[test]
+    fn install_draft_restores_settings_and_selection_after_reopening() {
+        let fixture = Fixture::new();
+        let root = fixture.0.canonicalize().unwrap();
+        let checkout = root.join("catalog");
+        let module = checkout.join("terminal");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("default.nix"), "{ home = {}; }").unwrap();
+        fs::write(
+            module.join("module.json"),
+            r#"{"schemaVersion":1,"title":"Terminal","description":"Terminal settings",
+                "layers":{"home":["linux"]}}"#,
+        )
+        .unwrap();
+        let spec = SourceSpec {
+            repository: checkout.display().to_string(),
+            reference: "HEAD".into(),
+            mode: SourceMode::Local,
+        };
+        let request = InstallRequest {
+            hostname: "smallbro".into(),
+            username: "acup".into(),
+            layout: DiskLayout::Erase {
+                disk: "/dev/sda".into(),
+                data: vec![install::DataPartition {
+                    role: install::DataRole::Home,
+                    filesystem: FileSystem::Btrfs,
+                    size_gib: 60,
+                    name: String::new(),
+                }],
+            },
+            swap_gib: 8,
+            hibernate: true,
+            ..default_request()
+        };
+        let directory = root.join("draft");
+        let mut first = controller(&root);
+        first.draft = Some(draft::Store::open(&directory).unwrap());
+        let mut session = Session::new(
+            Mode::Install,
+            vec![spec.clone()],
+            request.clone(),
+            String::new(),
+            String::new(),
+        );
+        first.refresh(&mut session, false).unwrap();
+        session.modules[0].selected = true;
+        first.checkpoint(&session).unwrap();
+        drop(first);
+
+        let mut second = controller(&root);
+        second.draft = Some(draft::Store::open(&directory).unwrap());
+        let saved = second.draft.as_ref().unwrap().saved().unwrap();
+        assert_eq!(saved.request, request);
+        assert!(saved.repositories == [spec]);
+        let mut restored = Session::new(
+            Mode::Install,
+            saved.repositories.clone(),
+            saved.request.clone(),
+            String::new(),
+            String::new(),
+        );
+        assert!(restored.plan.is_none());
+        fs::rename(&checkout, root.join("offline")).unwrap();
+        second.refresh(&mut restored, false).unwrap();
+        assert!(restored.modules.is_empty());
+        second.checkpoint(&restored).unwrap();
+        fs::rename(root.join("offline"), &checkout).unwrap();
+        second.refresh(&mut restored, false).unwrap();
+        assert!(restored.modules[0].selected);
+        restored.modules[0].selected = false;
+        second.checkpoint(&restored).unwrap();
+        let store = draft::Store::open(&directory).unwrap();
+        assert!(store.saved().unwrap().selections.is_empty());
+        store.clear().unwrap();
+        assert!(draft::Store::open(&directory).unwrap().saved().is_none());
     }
 
     #[test]
