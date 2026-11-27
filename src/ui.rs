@@ -5,7 +5,7 @@ use crate::catalog::{
 use crate::config::{Identity, validate_hostname, validate_username};
 use crate::install::{
     BlockDevice, BootMode, DataPartition, DataRole, DiskLayout, FileSystem, InstallPlan,
-    InstallRequest, MAX_DATA_PARTITIONS, confirmation_token, hibernation_swap_gib,
+    InstallRequest, MAX_DATA_PARTITIONS, confirmation, hibernation_swap_gib,
 };
 use crate::read_command::Cancellation;
 use serde_json::Value;
@@ -294,7 +294,11 @@ struct Editor {
 #[derive(Clone)]
 enum EditTarget {
     Field(Field),
-    Confirm(Action, String),
+    Confirm {
+        action: Action,
+        word: String,
+        warning: Vec<String>,
+    },
 }
 
 struct Choice {
@@ -1643,18 +1647,22 @@ impl Ui {
                 }
             }
             Some(Control::Confirm(action)) => {
-                let word = match &action {
+                let (word, warning) = match &action {
                     Action::ApplyInstall => match &state.plan {
-                        Some(plan) => confirmation_token(plan),
+                        Some(plan) => confirmation(plan),
                         None => return Outcome::Continue,
                     },
-                    Action::Calamares => "CALAMARES".into(),
+                    Action::Calamares => ("CALAMARES".into(), Vec::new()),
                     _ => return Outcome::Continue,
                 };
                 self.modal = Some(Modal::Edit(Editor {
                     text: String::new(),
                     cursor: 0,
-                    target: EditTarget::Confirm(action, word),
+                    target: EditTarget::Confirm {
+                        action,
+                        word,
+                        warning,
+                    },
                     error: None,
                 }));
             }
@@ -1691,10 +1699,10 @@ impl Ui {
                     Event::Key(10 | 13) => {
                         let result = match editor.target.clone() {
                             EditTarget::Field(field) => self.set_field(state, field, &editor.text),
-                            EditTarget::Confirm(action, word) if editor.text == word => {
+                            EditTarget::Confirm { action, word, .. } if editor.text == word => {
                                 return Outcome::Execute(action);
                             }
-                            EditTarget::Confirm(_, word) => {
+                            EditTarget::Confirm { word, .. } => {
                                 Err(format!("Type {word} exactly to continue."))
                             }
                         };
@@ -2038,6 +2046,13 @@ impl Ui {
 }
 
 impl Editor {
+    fn warning(&self) -> &[String] {
+        match &self.target {
+            EditTarget::Confirm { warning, .. } => warning,
+            EditTarget::Field(_) => &[],
+        }
+    }
+
     fn previous(&self) -> Option<usize> {
         self.text[..self.cursor]
             .char_indices()
@@ -2580,10 +2595,23 @@ impl Ui {
             )
         };
         line(frame, height - 2, 3, width - 6, &bottom.0, bottom.1, BG);
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        line(
+            frame,
+            height - 1,
+            width - version.len() as i32 - 3,
+            version.len() as i32,
+            version,
+            MUTED,
+            BG,
+        );
         if let Some(modal) = &mut self.modal {
             let w = (width - 8).min(76);
             let h = match modal {
-                Modal::Edit(_) => 9.min(height - 2),
+                Modal::Edit(editor) => {
+                    let warning_lines = editor.warning().len() as i32;
+                    (9 + warning_lines).min(height - 2)
+                }
                 Modal::Pick(_) => 15.min(height - 2),
                 Modal::Notice { .. } => 13.min(height - 2),
             };
@@ -2645,19 +2673,32 @@ fn render_editor(frame: &mut FrameBuffer, area: Area, editor: &Editor, state: &S
             field_title(*field),
             "Enter saves · Esc cancels · Ctrl+U clears".to_string(),
         ),
-        EditTarget::Confirm(_, word) => (
+        EditTarget::Confirm { word, .. } => (
             "Confirm operation",
             format!("Type {word} to continue. Esc cancels."),
         ),
     };
     box_panel(frame, area, title);
+    let warning = editor.warning();
+    for (index, text) in warning.iter().enumerate() {
+        line(
+            frame,
+            area.y + 1 + index as i32,
+            area.x + 2,
+            area.w - 4,
+            text,
+            RED,
+            PANEL,
+        );
+    }
+    let warning_lines = warning.len() as i32;
     line(
         frame,
-        area.y + 2,
+        area.y + 2 + warning_lines,
         area.x + 2,
         area.w - 4,
         &help,
-        if matches!(editor.target, EditTarget::Confirm(..)) {
+        if matches!(editor.target, EditTarget::Confirm { .. }) {
             RED
         } else {
             MUTED
@@ -2666,7 +2707,12 @@ fn render_editor(frame: &mut FrameBuffer, area: Area, editor: &Editor, state: &S
     );
     let input = Area {
         x: area.x + 2,
-        y: area.y + 4,
+        y: area.y
+            + if warning.is_empty() {
+                4
+            } else {
+                3 + warning_lines
+            },
         w: area.w - 4,
         h: 1,
     };
@@ -2694,7 +2740,15 @@ fn render_editor(frame: &mut FrameBuffer, area: Area, editor: &Editor, state: &S
         FOCUS,
     );
     if let Some(error) = &editor.error {
-        line(frame, area.y + 6, area.x + 2, area.w - 4, error, RED, PANEL);
+        line(
+            frame,
+            input.y + 2,
+            area.x + 2,
+            area.w - 4,
+            error,
+            RED,
+            PANEL,
+        );
     } else if let EditTarget::Field(Field::Parameter(row, parameter)) = editor.target {
         line(
             frame,
@@ -3282,6 +3336,11 @@ mod tests {
         let mut frame = FrameBuffer::new(98, 26);
         ui.render(&mut frame, &state);
         assert!(frame_text(&frame, 1).contains("NixOS Configuration"));
+        assert!(
+            frame_text(&frame, 25)
+                .trim_end()
+                .ends_with(concat!("v", env!("CARGO_PKG_VERSION")))
+        );
         let area = ui.nav_hits.iter().find(|(_, page)| *page == 1).unwrap().0;
         ui.event(
             &mut state,
@@ -3297,6 +3356,54 @@ mod tests {
         ui.render(&mut frame, &state);
         assert!(frame_text(&frame, 5).contains("Step 2 of 4"));
         assert!(frame_text(&frame, 8).contains("Filter modules"));
+    }
+
+    #[test]
+    fn format_confirmation_shows_devices_and_accepts_yes() {
+        let mut state = session();
+        state.mode = Mode::Install;
+        let mut ui = Ui {
+            modal: Some(Modal::Edit(Editor {
+                text: String::new(),
+                cursor: 0,
+                target: EditTarget::Confirm {
+                    action: Action::ApplyInstall,
+                    word: "yes".into(),
+                    warning: vec![
+                        "Erase data on these partitions".into(),
+                        "/dev/nvme0n1p3".into(),
+                        "/dev/nvme0n1p1".into(),
+                        "/dev/nvme0n1p2".into(),
+                    ],
+                },
+                error: None,
+            })),
+            ..Ui::default()
+        };
+        let mut frame = FrameBuffer::new(44, 14);
+        ui.render(&mut frame, &state);
+        assert!(
+            frame_text(&frame, 13)
+                .trim_end()
+                .ends_with(concat!("v", env!("CARGO_PKG_VERSION")))
+        );
+        for text in [
+            "/dev/nvme0n1p1",
+            "/dev/nvme0n1p2",
+            "/dev/nvme0n1p3",
+            "Type yes to continue.",
+        ] {
+            assert!((0..14).any(|row| frame_text(&frame, row).contains(text)));
+        }
+        assert!(matches!(
+            ui.event(&mut state, Event::Key(13)),
+            Outcome::Continue
+        ));
+        ui.event(&mut state, Event::Text("yes".into()));
+        assert!(matches!(
+            ui.event(&mut state, Event::Key(13)),
+            Outcome::Execute(Action::ApplyInstall)
+        ));
     }
 
     #[test]

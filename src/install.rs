@@ -295,10 +295,13 @@ pub fn build_plan(request: InstallRequest) -> Result<InstallPlan, String> {
     })
 }
 
-pub fn confirmation_token(plan: &InstallPlan) -> String {
+pub fn confirmation(plan: &InstallPlan) -> (String, Vec<String>) {
     match &plan.approved_request.layout {
-        DiskLayout::Erase { disk, .. } => format!("ERASE {disk}"),
-        DiskLayout::Alongside { disk, .. } => format!("INSTALL ALONGSIDE {disk}"),
+        DiskLayout::Erase { disk, .. } => (
+            "yes".into(),
+            vec!["Erase all data on this disk".into(), disk.clone()],
+        ),
+        DiskLayout::Alongside { disk, .. } => (format!("INSTALL ALONGSIDE {disk}"), Vec::new()),
         DiskLayout::Partitions {
             root,
             esp,
@@ -310,25 +313,26 @@ pub fn confirmation_token(plan: &InstallPlan) -> String {
         } => {
             let mut formatted = Vec::new();
             if *format_root {
-                formatted.push(root.as_str());
+                formatted.push(root.clone());
             }
             if *format_esp && let Some(esp) = esp {
-                formatted.push(esp.as_str());
+                formatted.push(esp.clone());
             }
             if plan.approved_request.partition_swap()
                 && *format_swap
                 && let Some(swap) = swap
             {
-                formatted.push(swap.as_str());
+                formatted.push(swap.clone());
             }
             if formatted.is_empty() {
-                format!("INSTALL {root}")
+                (format!("INSTALL {root}"), Vec::new())
             } else {
-                format!("ERASE {}", formatted.join(" "))
+                formatted.insert(0, "Erase data on these partitions".into());
+                ("yes".into(), formatted)
             }
         }
-        DiskLayout::Mounted { target } => format!("INSTALL {}", target.display()),
-        DiskLayout::InPlace => "INSTALL IN PLACE /".into(),
+        DiskLayout::Mounted { target } => (format!("INSTALL {}", target.display()), Vec::new()),
+        DiskLayout::InPlace => ("INSTALL IN PLACE /".into(), Vec::new()),
     }
 }
 
@@ -1387,6 +1391,7 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
         ]);
     }
     let mut tools = vec![
+        "nix",
         "nixos-generate-config",
         "nixos-install",
         "nixos-enter",
@@ -1615,7 +1620,7 @@ fn install(
     configure(target, request)?;
 
     if target_mounts(target, &mounts()?)? != accepted_mounts {
-        return Err("A target mount changed before NixOS installation.".into());
+        return Err("A target mount changed before locking the NixOS inputs.".into());
     }
     if !config_dir.join("flake.nix").is_file() {
         return Err(format!(
@@ -1624,7 +1629,27 @@ fn install(
         ));
     }
 
-    let flake = format!("{}#{}", config_dir.display(), request.hostname);
+    let flake_path = format!("path:{}", config_dir.display());
+    // Resolve inputs before the build takes a snapshot of the target flake.
+    install_command(
+        "nix",
+        "Lock NixOS flake inputs",
+        [
+            OsStr::new("--extra-experimental-features"),
+            OsStr::new("nix-command flakes"),
+            OsStr::new("flake"),
+            OsStr::new("lock"),
+            OsStr::new("--store"),
+            target.as_os_str(),
+            OsStr::new("--impure"),
+            OsStr::new(&flake_path),
+        ],
+    )?;
+    if target_mounts(target, &mounts()?)? != accepted_mounts {
+        return Err("A target mount changed before NixOS installation.".into());
+    }
+
+    let flake = format!("{flake_path}#{}", request.hostname);
     install_command(
         "nixos-install",
         "Build and install NixOS",
@@ -1636,6 +1661,7 @@ fn install(
             OsStr::new("--flake"),
             OsStr::new(&flake),
             OsStr::new("--impure"),
+            OsStr::new("--no-update-lock-file"),
         ],
     )
     .map_err(|error| {
@@ -2273,7 +2299,12 @@ mod tests {
             swap: None,
             format_swap: false,
         });
-        assert_eq!(confirmation_token(&plan), "ERASE /dev/nvme0n1p2");
+        let (word, warning) = confirmation(&plan);
+        assert_eq!(word, "yes");
+        assert_eq!(
+            warning,
+            ["Erase data on these partitions", "/dev/nvme0n1p2"]
+        );
         assert!(
             plan.steps
                 .iter()
@@ -2290,12 +2321,17 @@ mod tests {
         let mounted = simulated_plan(DiskLayout::Mounted {
             target: "/mnt/nixos".into(),
         });
-        assert_eq!(confirmation_token(&erase), "ERASE /dev/sda");
-        assert_eq!(confirmation_token(&mounted), "INSTALL /mnt/nixos");
+        let (word, warning) = confirmation(&erase);
+        assert_eq!(word, "yes");
+        assert_eq!(warning, ["Erase all data on this disk", "/dev/sda"]);
+        assert_eq!(
+            confirmation(&mounted),
+            ("INSTALL /mnt/nixos".into(), Vec::new())
+        );
     }
 
     #[test]
-    fn formatting_a_selected_swap_partition_requires_its_device_in_confirmation() {
+    fn formatting_a_selected_swap_partition_lists_its_device_in_confirmation() {
         let mut plan = simulated_plan(DiskLayout::Partitions {
             root: "/dev/sda3".into(),
             esp: None,
@@ -2307,7 +2343,12 @@ mod tests {
         });
         plan.request.swap_gib = 4;
         plan.approved_request = plan.request.clone();
-        assert_eq!(confirmation_token(&plan), "ERASE /dev/sda3 /dev/sda2");
+        let (word, warning) = confirmation(&plan);
+        assert_eq!(word, "yes");
+        assert_eq!(
+            warning,
+            ["Erase data on these partitions", "/dev/sda3", "/dev/sda2"]
+        );
     }
 
     #[test]
