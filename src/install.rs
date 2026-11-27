@@ -9,6 +9,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const ROOT_MINIMUM: u64 = 8 * GIB;
@@ -1383,7 +1385,7 @@ fn describe_steps(request: &InstallRequest, checked: &CheckedTarget) -> Vec<Stri
 pub fn apply_plan(
     plan: &InstallPlan,
     configure: impl FnOnce(&Path, &InstallRequest) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     linux()?;
     require_root()?;
     require_terminal()?;
@@ -1405,7 +1407,8 @@ pub fn apply_plan(
     }
 
     if matches!(request.layout, DiskLayout::InPlace) {
-        return inplace::apply(request, &checked, state_version, configure);
+        inplace::apply(request, &checked, state_version, configure)?;
+        return Ok("NixOS boot entry is ready. Reboot manually to enter NixOS and preserve the former root under /old-root.".into());
     }
 
     let mut session = InstallMounts {
@@ -1415,7 +1418,10 @@ pub fn apply_plan(
     let result = install(request, &checked, state_version, &mut session, configure);
     let cleanup = session.clean();
     match (result, cleanup) {
-        (Ok(()), clean) => clean,
+        (Ok(()), Ok(())) => Ok("Installation completed. Reboot to start NixOS.".into()),
+        (Ok(()), Err(error)) => Ok(format!(
+            "Installation completed. Reboot normally to finish cleanup. {error}"
+        )),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!(
             "{error}\nCould not clean up the installation environment: {cleanup}"
@@ -1968,12 +1974,7 @@ impl InstallMounts {
 
     fn clean(&mut self) -> Result<(), String> {
         if let Some(path) = self.active_swap.take() {
-            command("swapoff", [OsStr::new("--"), path.as_os_str()]).map_err(|error| {
-                format!(
-                    "Could not disable installation swap at {}. {error}",
-                    path.display()
-                )
-            })?;
+            disable_installation_swap(&path)?;
         }
         while let Some(expected) = self.mounted.pop() {
             let now: Vec<_> = mounts()?
@@ -1986,15 +1987,59 @@ impl InstallMounts {
                     expected.destination.display()
                 ));
             }
+            eprintln!("Unmounting {}.", expected.destination.display());
             command(
                 "umount",
                 [OsStr::new("--"), expected.destination.as_os_str()],
             )?;
         }
         if let Some(mapper) = self.mapper.take() {
+            eprintln!("Closing the encrypted installation volume.");
             command("cryptsetup", ["close", "--", mapper.as_str()])?;
         }
         Ok(())
+    }
+}
+
+fn disable_installation_swap(path: &Path) -> Result<(), String> {
+    eprintln!(
+        "Disabling installation swap at {}. Reading swapped pages can take a while.",
+        path.display()
+    );
+    let error = |error: io::Error| {
+        format!(
+            "Could not disable installation swap at {}. {error}",
+            path.display()
+        )
+    };
+    let mut child = Command::new("swapoff")
+        .arg("--")
+        .arg(path)
+        .spawn()
+        .map_err(error)?;
+    let start = Instant::now();
+    let report_interval = Duration::from_secs(10);
+    let mut next_report = report_interval;
+    loop {
+        if let Some(status) = child.try_wait().map_err(error)? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Could not disable installation swap at {}. swapoff failed ({status}).",
+                    path.display()
+                ))
+            };
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= next_report {
+            eprintln!(
+                "Still disabling installation swap ({} seconds).",
+                elapsed.as_secs()
+            );
+            next_report = elapsed + report_interval;
+        }
+        thread::sleep(Duration::from_millis(250));
     }
 }
 

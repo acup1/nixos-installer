@@ -601,11 +601,6 @@ impl Controller {
             fs::set_permissions(&state_file, fs::Permissions::from_mode(0o644))
                 .map_err(|e| e.to_string())?;
             Ok(())
-        })?;
-        Ok(if matches!(state.install.layout, DiskLayout::InPlace) {
-            "NixOS boot entry is ready. Reboot manually to enter NixOS and preserve the former root under /old-root.".into()
-        } else {
-            "Installation completed".into()
         })
     }
     fn check_local_install(&self, choices: &[Choice]) -> Result<()> {
