@@ -203,7 +203,28 @@ pub(super) fn format_filesystem(filesystem: FileSystem, path: &Path) -> Result<(
     )
 }
 
-pub(super) fn prepare_swap(device: &DeviceIdentity, format: bool) -> Result<String, String> {
+pub(super) struct PreparedSwap {
+    pub persistent_path: String,
+    number: u64,
+}
+
+impl PreparedSwap {
+    pub fn current_path(&self) -> Result<PathBuf, String> {
+        let path = fs::canonicalize(&self.persistent_path)
+            .map_err(|error| format!("{}: {error}", self.persistent_path))?;
+        let metadata =
+            fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        if !metadata.file_type().is_block_device() || metadata.rdev() != self.number {
+            return Err(format!(
+                "{} points to a different swap device.",
+                self.persistent_path
+            ));
+        }
+        Ok(path)
+    }
+}
+
+pub(super) fn prepare_swap(device: &DeviceIdentity, format: bool) -> Result<PreparedSwap, String> {
     ensure_same_idle(device)?;
     let uuid = device
         .record
@@ -224,7 +245,10 @@ pub(super) fn prepare_swap(device: &DeviceIdentity, format: bool) -> Result<Stri
     if format {
         command("mkswap", ["--", device.record.path.as_str()])?;
     }
-    Ok(format!("/dev/disk/by-partuuid/{uuid}"))
+    Ok(PreparedSwap {
+        persistent_path: format!("/dev/disk/by-partuuid/{uuid}"),
+        number: device.number,
+    })
 }
 
 pub(super) fn swap_configuration(

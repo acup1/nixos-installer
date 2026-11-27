@@ -17,6 +17,56 @@ const TARGET: &str = "/mnt";
 const EFI_GUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 const LINUX_GUID: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
 const BIOS_GUID: &str = "21686148-6449-6e6f-744e-656564454649";
+const KIB_PER_MIB: u64 = 1024;
+
+#[derive(Clone, Copy, Default)]
+struct LiveMemory {
+    total_kib: Option<u64>,
+    swap_free_kib: Option<u64>,
+}
+
+impl LiveMemory {
+    fn read() -> Self {
+        fs::read_to_string("/proc/meminfo")
+            .map_or_else(|_| Self::default(), |info| Self::parse(&info))
+    }
+
+    fn parse(info: &str) -> Self {
+        let get = |key: &str| {
+            info.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name == key {
+                    value.split_whitespace().next()?.parse().ok()
+                } else {
+                    None
+                }
+            })
+        };
+        Self {
+            total_kib: get("MemTotal"),
+            swap_free_kib: get("SwapFree"),
+        }
+    }
+
+    fn build_flags(self) -> &'static [&'static str] {
+        if self
+            .total_kib
+            .is_some_and(|kib| kib > 0 && kib <= 4096 * KIB_PER_MIB)
+        {
+            &["--max-jobs", "1", "--cores", "1"]
+        } else {
+            &[]
+        }
+    }
+
+    fn use_target_swap(self, request: &InstallRequest) -> bool {
+        request.swap_gib > 0
+            && !self.build_flags().is_empty()
+            && self
+                .swap_free_kib
+                .is_some_and(|kib| kib < 512 * KIB_PER_MIB)
+    }
+}
 
 pub fn suggested_account() -> Option<String> {
     inplace::suggested_account()
@@ -1344,7 +1394,8 @@ pub fn apply_plan(
     }
     let request = &plan.approved_request;
     validate_settings(request)?;
-    preflight(request)?;
+    let memory = LiveMemory::read();
+    preflight(request, memory.use_target_swap(request))?;
     let state_version = "26.05";
     let checked = inspect_target(request, &probe()?, &mounts()?)?;
     if checked != plan.checked {
@@ -1357,19 +1408,22 @@ pub fn apply_plan(
         return inplace::apply(request, &checked, state_version, configure);
     }
 
-    let mut session = InstallMounts::default();
+    let mut session = InstallMounts {
+        memory,
+        ..InstallMounts::default()
+    };
     let result = install(request, &checked, state_version, &mut session, configure);
     let cleanup = session.clean();
     match (result, cleanup) {
         (Ok(()), clean) => clean,
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!(
-            "{error}\nCould not clean up installer mounts: {cleanup}"
+            "{error}\nCould not clean up the installation environment: {cleanup}"
         )),
     }
 }
 
-fn preflight(request: &InstallRequest) -> Result<(), String> {
+fn preflight(request: &InstallRequest, use_target_swap: bool) -> Result<(), String> {
     if request.boot_mode == BootMode::Uefi
         && !mounts()?.iter().any(|mount| {
             mount.destination == Path::new("/sys/firmware/efi/efivars")
@@ -1458,6 +1512,9 @@ fn preflight(request: &InstallRequest) -> Result<(), String> {
             FileSystem::Btrfs => tools.push("btrfs"),
             _ => tools.extend(["fallocate", "mkswap"]),
         }
+    }
+    if use_target_swap {
+        tools.extend(["swapon", "swapoff"]);
     }
     tools_available(&tools)
 }
@@ -1610,7 +1667,9 @@ fn install(
     let configuration = configuration(
         request,
         boot_disk.as_deref(),
-        swap_device.as_deref(),
+        swap_device
+            .as_ref()
+            .map(|swap| swap.persistent_path.as_str()),
         state_version,
     )?;
     write_new(
@@ -1628,9 +1687,20 @@ fn install(
             config_dir.display()
         ));
     }
+    if session.memory.use_target_swap(request) {
+        let swap_path = swap_device.as_ref().map_or_else(
+            || Ok(target.join("swapfile")),
+            partition::PreparedSwap::current_path,
+        );
+        match swap_path {
+            Ok(path) => session.enable_swap(path),
+            Err(error) => eprintln!("Could not enable the selected swap for installation. {error}"),
+        }
+    }
 
     let flake_path = format!("path:{}", config_dir.display());
     // Resolve inputs before the build takes a snapshot of the target flake.
+    eprintln!("Locking the NixOS flake inputs.");
     install_command(
         "nix",
         "Lock NixOS flake inputs",
@@ -1650,6 +1720,11 @@ fn install(
     }
 
     let flake = format!("{flake_path}#{}", request.hostname);
+    let build_flags = session.memory.build_flags();
+    if !build_flags.is_empty() {
+        eprintln!("Using one Nix build job and one core per job on this low-memory system.");
+    }
+    eprintln!("Building and installing NixOS.");
     install_command(
         "nixos-install",
         "Build and install NixOS",
@@ -1662,7 +1737,9 @@ fn install(
             OsStr::new(&flake),
             OsStr::new("--impure"),
             OsStr::new("--no-update-lock-file"),
-        ],
+        ]
+        .into_iter()
+        .chain(build_flags.iter().map(OsStr::new)),
     )
     .map_err(|error| {
         format!("{error}\nThe target configuration remains at /etc/nixos for recovery.")
@@ -1854,9 +1931,22 @@ fn matches_gpt_part(device: &BlockDevice, partition: &GptPartition) -> bool {
 struct InstallMounts {
     mounted: Vec<Mount>,
     mapper: Option<String>,
+    memory: LiveMemory,
+    active_swap: Option<PathBuf>,
 }
 
 impl InstallMounts {
+    fn enable_swap(&mut self, path: PathBuf) {
+        eprintln!(
+            "Enabling the selected swap for installation at {}.",
+            path.display()
+        );
+        match command("swapon", [OsStr::new("--"), path.as_os_str()]) {
+            Ok(()) => self.active_swap = Some(path),
+            Err(error) => eprintln!("Could not enable the selected swap for installation. {error}"),
+        }
+    }
+
     fn mount(&mut self, source: &Path, target: &Path, filesystem: &str) -> Result<(), String> {
         command(
             "mount",
@@ -1877,6 +1967,14 @@ impl InstallMounts {
     }
 
     fn clean(&mut self) -> Result<(), String> {
+        if let Some(path) = self.active_swap.take() {
+            command("swapoff", [OsStr::new("--"), path.as_os_str()]).map_err(|error| {
+                format!(
+                    "Could not disable installation swap at {}. {error}",
+                    path.display()
+                )
+            })?;
+        }
         while let Some(expected) = self.mounted.pop() {
             let now: Vec<_> = mounts()?
                 .into_iter()
@@ -2286,6 +2384,28 @@ mod tests {
             request,
             checked,
         }
+    }
+
+    #[test]
+    fn low_memory_install_limits_builds_and_uses_only_selected_swap() {
+        let mut request = request(DiskLayout::Mounted {
+            target: TARGET.into(),
+        });
+        let low_memory = LiveMemory::parse("MemTotal: 1873456 kB\nSwapFree: 0 kB\n");
+        assert_eq!(
+            low_memory.build_flags(),
+            ["--max-jobs", "1", "--cores", "1"]
+        );
+        assert!(!low_memory.use_target_swap(&request));
+        request.swap_gib = 4;
+        assert!(low_memory.use_target_swap(&request));
+
+        let existing_swap = LiveMemory::parse("MemTotal: 1873456 kB\nSwapFree: 1048576 kB\n");
+        assert!(!existing_swap.use_target_swap(&request));
+        let ample_memory = LiveMemory::parse("MemTotal: 8388608 kB\nSwapFree: 0 kB\n");
+        assert!(ample_memory.build_flags().is_empty());
+        assert!(!ample_memory.use_target_swap(&request));
+        assert!(!LiveMemory::default().use_target_swap(&request));
     }
 
     #[test]
