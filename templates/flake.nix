@@ -3,17 +3,19 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     home-manager.url = "github:nix-community/home-manager";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
+    nixos-base.url = "github:acup1/nixos-base/main";
+    nixos-base.inputs.nixpkgs.follows = "nixpkgs";
+    nixos-base.inputs.home-manager.follows = "home-manager";
   };
-  outputs = { self, nixpkgs, home-manager, ... } @ inputs: let
+  outputs = { self, nixos-base, home-manager, ... } @ inputs: let
     selector = builtins.getEnv "NIXOS_BASE_CONFIG";
     cfg = import (if selector == "" then ./config.nix else builtins.toPath selector) { inherit inputs; };
     inherit (cfg) system username flakeDir;
     specialArgs = { inherit self inputs system username flakeDir; };
   in {
-    nixosConfigurations.${cfg.hostName or @HOST@} = nixpkgs.lib.nixosSystem {
-      inherit system specialArgs;
-      modules = [
-        ./configuration.nix
+    nixosConfigurations.${cfg.hostName or @HOST@} = nixos-base.lib.mkNixosSystem {
+      config = cfg // { nixosHostConfiguration = ./configuration.nix; };
+      extraModules = [
         home-manager.nixosModules.home-manager
         {
           programs.nh.enable = true;
@@ -26,7 +28,7 @@
             home.stateVersion = "26.05";
           };
         }
-      ] ++ map (bundle: bundle.nixos or {}) cfg.modules;
+      ];
     };
   };
 }

@@ -1178,29 +1178,41 @@ impl RebuildTarget {
         })
     }
 
-    fn command(&self, selector: &Path) -> Command {
-        let mut command = Command::new("nh");
-        command
-            .args([
+    fn command(&self, selector: &Path, root: bool) -> Command {
+        let mut command = if root && self.platform == HostPlatform::Linux {
+            let mut command = Command::new("nixos-rebuild");
+            command.args([
+                "switch",
+                "--flake",
+                &format!("{}#{}", self.flake, self.name),
+            ]);
+            command
+        } else {
+            let mut command = Command::new("nh");
+            command.args([
                 self.platform.nh_command(),
                 "switch",
                 "--hostname",
                 &self.name,
                 &self.flake,
                 "--",
-                "--impure",
-            ])
-            .env("NIXOS_BASE_CONFIG", selector);
+            ]);
+            command
+        };
+        command.arg("--impure").env("NIXOS_BASE_CONFIG", selector);
+        if selector == Path::new(INSTALLED_SELECTOR) {
+            command.arg("--no-update-lock-file");
+        }
         command
     }
 
     pub fn rebuild(&self, selector: &Path, gc_after_rebuild: bool) -> Result<()> {
         let status = self
-            .command(selector)
+            .command(selector, unsafe { libc::geteuid() } == 0)
             .status()
-            .map_err(|e| format!("nh: {e}"))?;
+            .map_err(|e| format!("Could not start the system rebuild: {e}"))?;
         if !status.success() {
-            return Err(format!("nh exited with {status}"));
+            return Err(format!("The system rebuild exited with {status}"));
         }
         if gc_after_rebuild {
             let status = Command::new("nix-collect-garbage")
@@ -1333,7 +1345,7 @@ mod selector_tests {
         );
         let darwin = RebuildTarget::resolve_for(&flake, &selector, HostPlatform::Darwin).unwrap();
         assert!(darwin.flake.starts_with("path:") && darwin.flake.ends_with("/host%20flake"));
-        let command = darwin.command(&selector);
+        let command = darwin.command(&selector, false);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [
@@ -1354,6 +1366,11 @@ mod selector_tests {
         );
         let linux = RebuildTarget::resolve_for(&flake, &selector, HostPlatform::Linux).unwrap();
         assert_eq!(linux.name, "nixos");
+        assert_eq!(
+            linux.command(&selector, true).get_program(),
+            "nixos-rebuild"
+        );
+        assert_eq!(linux.command(&selector, false).get_program(), "nh");
         let explicit =
             RebuildTarget::resolve_for(&format!("{flake}#other"), &selector, HostPlatform::Darwin)
                 .unwrap();
@@ -1663,10 +1680,10 @@ mod selector_tests {
           let
             fake = {{
               self = {{}};
-              nixpkgs.lib.nixosSystem = args: {{
-                inherit (args) system;
-                inherit (args.specialArgs) username;
-              }};
+              nixos-base.lib.mkNixosSystem = {{ config, extraModules }}:
+                assert builtins.baseNameOf config.nixosHostConfiguration == "configuration.nix";
+                assert builtins.length extraModules == 2;
+                {{ inherit (config) system username; }};
               home-manager.nixosModules.home-manager = {{}};
             }};
             flake = import (builtins.toPath {});

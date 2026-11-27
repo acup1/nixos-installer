@@ -998,9 +998,13 @@ fn installed_local_checkout(
 }
 
 fn copy_commit(source: &CatalogSource, dest: &Path) -> Result<()> {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+
     let rev = source.revision.as_deref().ok_or("Missing local commit")?;
-    fs::create_dir_all(dest.parent().ok_or("Invalid destination")?).map_err(|e| e.to_string())?;
+    install::create_directory(dest.parent().ok_or("Invalid destination")?)?;
     fs::create_dir(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("{}: {e}", dest.display()))?;
     for args in [
         vec!["init", "--quiet", "--template="],
         vec![
@@ -1014,7 +1018,15 @@ fn copy_commit(source: &CatalogSource, dest: &Path) -> Result<()> {
         ],
         vec!["checkout", "--quiet", "--detach", rev],
     ] {
-        let status = Command::new("git")
+        let mut git = Command::new("git");
+        // The copied configuration must be readable by the user building the system.
+        unsafe {
+            git.pre_exec(|| {
+                libc::umask(0o022);
+                Ok(())
+            });
+        }
+        let status = git
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")

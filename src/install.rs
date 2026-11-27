@@ -2043,9 +2043,10 @@ fn disable_installation_swap(path: &Path) -> Result<(), String> {
     }
 }
 
-fn create_directory(path: &Path) -> Result<(), String> {
+pub fn create_directory(path: &Path) -> Result<(), String> {
     match fs::create_dir(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("{}: {error}", path.display())),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -2067,6 +2068,7 @@ fn write_new(path: &Path, data: &[u8]) -> Result<(), String> {
         .open(path)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     file.write_all(data)
+        .and_then(|_| file.set_permissions(fs::Permissions::from_mode(0o644)))
         .and_then(|_| file.sync_all())
         .map_err(|error| format!("{}: {error}", path.display()))
 }
